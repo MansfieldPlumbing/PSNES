@@ -1,6 +1,4 @@
 #requires -Version 7.0
-using namespace System
-using namespace System.IO
 
 [CmdletBinding()]
 param(
@@ -38,9 +36,9 @@ class Rom {
         $this.PrgRom = $null
         $this.ChrRom = $null
         $this.ChrRam = $false
-        if (-not [File]::Exists($filePath)) { return $false }
+        if (-not [IO.File]::Exists($filePath)) { return $false }
         
-        [byte[]] $data = [File]::ReadAllBytes($filePath)
+        [byte[]] $data = [IO.File]::ReadAllBytes($filePath)
         if ($data.Length -lt 16) { return $false }
 
         # Check iNES Magic "NES<EOF>"
