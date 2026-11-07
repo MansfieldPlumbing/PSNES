@@ -4,8 +4,9 @@ using namespace System.IO
 
 [CmdletBinding()]
 param(
-    [object] $Canvas = $null,
-    [object] $Input = $null,
+    # An iNES image to play in a window.
+    [string] $Rom,
+    # Run the built-in conformance suite instead.
     [switch] $Conformance
 )
 
@@ -2502,23 +2503,6 @@ class Nes {
         if ($this.Rom.IsValid) { $this.Cpu.Reset() }
     }
 
-    [void] SetControllerInput([object] $state) {
-        if ($null -eq $state) { return }
-        # The host contract presents normalized controls under Player1.
-        # Accept a direct Player1 record too for independent tests.
-        $player = $state.PSObject.Properties['Player1']
-        if ($null -ne $player -and $null -ne $player.Value) { $state = $player.Value }
-        [int] $buttons = 0
-        $names = @('A','B','Select','Start','Up','Down','Left','Right')
-        for ([int] $i = 0; $i -lt $names.Length; $i++) {
-            $property = $state.PSObject.Properties[$names[$i]]
-            if ($null -ne $property -and [bool]$property.Value) {
-                $buttons = $buttons -bor (1 -shl $i)
-            }
-        }
-        $this.Memory.SetControllerState([byte]$buttons, 0)
-    }
-
     [void] RunFrame() {
         if (-not $this.Rom.IsValid) { return }
         $this.Ppu.StartFrame()
@@ -2528,17 +2512,312 @@ class Nes {
         $this.Ppu.RenderFrame()
         $this.Ppu.FrameEnded = $false
     }
+}
 
-    [void] RunFrame([object] $input) {
-        $this.SetControllerInput($input)
-        $this.RunFrame()
+# ============================================================================
+# WINDOW
+# ============================================================================
+
+# Native calls. One StdCall delegate type is emitted per signature; layouts and
+# signatures follow the Windows SDK 10.0.26100.0 headers (WinUser.h, wingdi.h, dwmapi.h).
+class Win32 {
+    static [Reflection.Emit.ModuleBuilder] $Module = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly(
+        [Reflection.AssemblyName]::new('PSNES.Native'), [Reflection.Emit.AssemblyBuilderAccess]::Run).DefineDynamicModule('Native')
+    static [Collections.Generic.Dictionary[string, Type]] $Shapes = [Collections.Generic.Dictionary[string, Type]]::new()
+    static [Collections.Generic.Dictionary[string, IntPtr]] $Libraries = [Collections.Generic.Dictionary[string, IntPtr]]::new([StringComparer]::OrdinalIgnoreCase)
+
+    static [IntPtr] Export([string] $library, [string] $name) {
+        if (-not [Win32]::Libraries.ContainsKey($library)) {
+            [Win32]::Libraries[$library] = [Runtime.InteropServices.NativeLibrary]::Load($library)
+        }
+        return [Runtime.InteropServices.NativeLibrary]::GetExport([Win32]::Libraries[$library], $name)
     }
 
-    [void] DrawFrame([object] $canvas) {
-        if ($null -eq $canvas) { return }
-        $canvas.Begin()
-        $canvas.DrawPixels($this.Ppu.Pixels, 256, 240, 256)
-        $canvas.End()
+    static [Delegate] Bind([string] $library, [string] $name, [Type] $returnType, [Type[]] $parameterTypes) {
+        [string] $shape = $returnType.FullName + '('
+        foreach ($parameterType in $parameterTypes) { $shape += $parameterType.FullName + ',' }
+        if (-not [Win32]::Shapes.ContainsKey($shape)) {
+            $builder = [Win32]::Module.DefineType('Call' + [Win32]::Shapes.Count, 'Class,Public,Sealed', [MulticastDelegate])
+            $constructor = $builder.DefineConstructor('Public,HideBySig,RTSpecialName', [Reflection.CallingConventions]::Standard, [Type[]]@([object], [IntPtr]))
+            $constructor.SetImplementationFlags('Runtime,Managed')
+            $invoke = $builder.DefineMethod('Invoke', 'Public,HideBySig,NewSlot,Virtual', $returnType, $parameterTypes)
+            $invoke.SetImplementationFlags('Runtime,Managed')
+            $builder.SetCustomAttribute([Reflection.Emit.CustomAttributeBuilder]::new(
+                [Runtime.InteropServices.UnmanagedFunctionPointerAttribute].GetConstructor([Type[]]@([Runtime.InteropServices.CallingConvention])),
+                [object[]]@([Runtime.InteropServices.CallingConvention]::StdCall)))
+            [Win32]::Shapes[$shape] = $builder.CreateType()
+        }
+        return [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer([Win32]::Export($library, $name), [Win32]::Shapes[$shape])
+    }
+}
+
+# Palette indices to opaque 0xAARRGGBB, and the bounding box of what changed between frames.
+class NesBlit {
+    static [void] Convert([byte[]] $indices, [int[]] $palette, [int[]] $target) {
+        [int] $count = $indices.Length
+        for ([int] $i = 0; $i -lt $count; $i++) {
+            $target[$i] = $palette[[int]$indices[$i] -band 63]
+        }
+    }
+
+    # Stats: changed pixels, pixels that changed back to the frame before last, then left, top, right, bottom.
+    static [void] Damage([int[]] $older, [int[]] $previous, [int[]] $current, [int[]] $stats) {
+        [int] $left = 256; [int] $right = -1; [int] $top = 240; [int] $bottom = -1
+        [int] $changed = 0; [int] $returned = 0; [int] $at = 0
+        for ([int] $y = 0; $y -lt 240; $y++) {
+            for ([int] $x = 0; $x -lt 256; $x++) {
+                if ($current[$at] -ne $previous[$at]) {
+                    $changed++
+                    if ($current[$at] -eq $older[$at]) { $returned++ }
+                    if ($x -lt $left) { $left = $x }
+                    if ($x -gt $right) { $right = $x }
+                    if ($y -lt $top) { $top = $y }
+                    $bottom = $y
+                }
+                $at++
+            }
+        }
+        $stats[0] = $changed; $stats[1] = $returned; $stats[2] = $left; $stats[3] = $top; $stats[4] = $right; $stats[5] = $bottom
+    }
+}
+
+# A Windows 11 window with a system backdrop. Frames go through a ring of three buffers:
+# only the rectangle that changed reaches GDI, and frames that did not change are skipped.
+class NesWindow {
+    # FCEUX's NES palette, 0xRRGGBB per colour index.
+    static [int[]] $Palette = @(
+        0x747474, 0x24188C, 0x0000A8, 0x44009C, 0x8C0074, 0xA80010, 0xA40000, 0x7C0800, 0x402C00, 0x004400, 0x005000, 0x003C14, 0x183C5C, 0x000000, 0x000000, 0x000000,
+        0xBCBCBC, 0x0070EC, 0x2038EC, 0x8000F0, 0xBC00BC, 0xE40058, 0xD82800, 0xC84C0C, 0x887000, 0x009400, 0x00A800, 0x009038, 0x008088, 0x000000, 0x000000, 0x000000,
+        0xFCFCFC, 0x3CBCFC, 0x5C94FC, 0xCC88FC, 0xF478FC, 0xFC74B4, 0xFC7460, 0xFC9838, 0xF0BC3C, 0x80D010, 0x4CDC48, 0x58F898, 0x00E8D8, 0x787878, 0x000000, 0x000000,
+        0xFCFCFC, 0xA8E4FC, 0xC4D4FC, 0xD4C8FC, 0xFCC4FC, 0xFCC4D8, 0xFCBCB0, 0xFCD8A8, 0xFCE4A0, 0xE0FCA0, 0xA8F0BC, 0xB0FCCC, 0x9CFCF0, 0xC4C4C4, 0x000000, 0x000000)
+    # Virtual-key code for each controller bit, A B Select Start Up Down Left Right: X Z RShift Enter and the arrows.
+    static [int[]] $Keys = @(0x58, 0x5A, 0xA1, 0x0D, 0x26, 0x28, 0x25, 0x27)
+
+    [IntPtr] $Handle
+    [IntPtr] $Device
+    [IntPtr] $Module
+    [IntPtr] $ClassName
+    [IntPtr] $Header
+    [IntPtr] $Message
+    [IntPtr] $Rect
+    [int] $ClientWide
+    [int] $ClientTall
+    [int] $Scale = 1
+    [int] $OriginX
+    [int] $OriginY
+    [int[]] $Colors = [int[]]::new(64)
+    [int[][]] $Ring = @([int[]]::new(61440), [int[]]::new(61440), [int[]]::new(61440))
+    [Runtime.InteropServices.GCHandle[]] $Pins = [Runtime.InteropServices.GCHandle[]]::new(3)
+    [int[]] $Facts = [int[]]::new(6)
+    [bool] $FullDraw = $true
+    [int] $Frames
+    [int] $Drawn
+    [int] $Skipped
+    [int] $Healed
+    [int] $Repaints
+
+    hidden [Delegate] $RegisterClassExW = [Win32]::Bind('user32.dll', 'RegisterClassExW', [uint16], [Type[]]@([IntPtr]))
+    hidden [Delegate] $UnregisterClassW = [Win32]::Bind('user32.dll', 'UnregisterClassW', [int], [Type[]]@([IntPtr], [IntPtr]))
+    hidden [Delegate] $CreateWindowExW = [Win32]::Bind('user32.dll', 'CreateWindowExW', [IntPtr], [Type[]]@([uint32], [IntPtr], [IntPtr], [uint32], [int], [int], [int], [int], [IntPtr], [IntPtr], [IntPtr], [IntPtr]))
+    hidden [Delegate] $DestroyWindow = [Win32]::Bind('user32.dll', 'DestroyWindow', [int], [Type[]]@([IntPtr]))
+    hidden [Delegate] $IsWindow = [Win32]::Bind('user32.dll', 'IsWindow', [int], [Type[]]@([IntPtr]))
+    hidden [Delegate] $ShowWindow = [Win32]::Bind('user32.dll', 'ShowWindow', [int], [Type[]]@([IntPtr], [int]))
+    hidden [Delegate] $SetForegroundWindow = [Win32]::Bind('user32.dll', 'SetForegroundWindow', [int], [Type[]]@([IntPtr]))
+    hidden [Delegate] $GetForegroundWindow = [Win32]::Bind('user32.dll', 'GetForegroundWindow', [IntPtr], [Type[]]@())
+    hidden [Delegate] $PeekMessageW = [Win32]::Bind('user32.dll', 'PeekMessageW', [int], [Type[]]@([IntPtr], [IntPtr], [uint32], [uint32], [uint32]))
+    hidden [Delegate] $TranslateMessage = [Win32]::Bind('user32.dll', 'TranslateMessage', [int], [Type[]]@([IntPtr]))
+    hidden [Delegate] $DispatchMessageW = [Win32]::Bind('user32.dll', 'DispatchMessageW', [IntPtr], [Type[]]@([IntPtr]))
+    hidden [Delegate] $LoadCursorW = [Win32]::Bind('user32.dll', 'LoadCursorW', [IntPtr], [Type[]]@([IntPtr], [IntPtr]))
+    hidden [Delegate] $LoadIconW = [Win32]::Bind('user32.dll', 'LoadIconW', [IntPtr], [Type[]]@([IntPtr], [IntPtr]))
+    hidden [Delegate] $GetClientRect = [Win32]::Bind('user32.dll', 'GetClientRect', [int], [Type[]]@([IntPtr], [IntPtr]))
+    hidden [Delegate] $GetDC = [Win32]::Bind('user32.dll', 'GetDC', [IntPtr], [Type[]]@([IntPtr]))
+    hidden [Delegate] $ReleaseDC = [Win32]::Bind('user32.dll', 'ReleaseDC', [int], [Type[]]@([IntPtr], [IntPtr]))
+    hidden [Delegate] $GetAsyncKeyState = [Win32]::Bind('user32.dll', 'GetAsyncKeyState', [int16], [Type[]]@([int]))
+    hidden [Delegate] $GetModuleHandleW = [Win32]::Bind('kernel32.dll', 'GetModuleHandleW', [IntPtr], [Type[]]@([IntPtr]))
+    hidden [Delegate] $GetStockObject = [Win32]::Bind('gdi32.dll', 'GetStockObject', [IntPtr], [Type[]]@([int]))
+    hidden [Delegate] $GetPixel = [Win32]::Bind('gdi32.dll', 'GetPixel', [uint32], [Type[]]@([IntPtr], [int], [int]))
+    hidden [Delegate] $StretchDIBits = [Win32]::Bind('gdi32.dll', 'StretchDIBits', [int], [Type[]]@([IntPtr], [int], [int], [int], [int], [int], [int], [int], [int], [IntPtr], [IntPtr], [uint32], [uint32]))
+    hidden [Delegate] $DwmSetWindowAttribute = [Win32]::Bind('dwmapi.dll', 'DwmSetWindowAttribute', [int], [Type[]]@([IntPtr], [uint32], [IntPtr], [uint32]))
+    hidden [Delegate] $DwmExtendFrameIntoClientArea = [Win32]::Bind('dwmapi.dll', 'DwmExtendFrameIntoClientArea', [int], [Type[]]@([IntPtr], [IntPtr]))
+
+    NesWindow([string] $title, [int] $wide, [int] $tall) {
+        # Alpha must be FF: the backdrop extends the frame over the client area, so the compositor
+        # reads alpha there and treats 00 as see-through. GetPixel sees only RGB and cannot catch it.
+        for ([int] $c = 0; $c -lt 64; $c++) { $this.Colors[$c] = [int](0xFF000000 -bor [NesWindow]::Palette[$c]) }
+        for ([int] $b = 0; $b -lt 3; $b++) { $this.Pins[$b] = [Runtime.InteropServices.GCHandle]::Alloc($this.Ring[$b], [Runtime.InteropServices.GCHandleType]::Pinned) }
+        $this.Message = [Runtime.InteropServices.Marshal]::AllocHGlobal(48)
+        $this.Rect = [Runtime.InteropServices.Marshal]::AllocHGlobal(16)
+        # BITMAPINFOHEADER: 256 wide, 240 tall top-down, one plane, 32 bits, BI_RGB.
+        $this.Header = [Runtime.InteropServices.Marshal]::AllocHGlobal(44)
+        [Runtime.InteropServices.Marshal]::Copy([byte[]]::new(44), 0, $this.Header, 44)
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.Header, 0, 40)
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.Header, 4, 256)
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.Header, 8, -240)
+        [Runtime.InteropServices.Marshal]::WriteInt16($this.Header, 12, 1)
+        [Runtime.InteropServices.Marshal]::WriteInt16($this.Header, 14, 32)
+
+        # WNDCLASSEXW, 80 bytes. The window procedure is DefWindowProcW itself: closing destroys
+        # the window, and the frame loop sees that through IsWindow.
+        $this.Module = $this.GetModuleHandleW.Invoke([IntPtr]::Zero)
+        $this.ClassName = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('PSNES')
+        $icon = $this.LoadIconW.Invoke([IntPtr]::Zero, [IntPtr]32512)
+        $class = [Runtime.InteropServices.Marshal]::AllocHGlobal(80)
+        try {
+            [Runtime.InteropServices.Marshal]::Copy([byte[]]::new(80), 0, $class, 80)
+            [Runtime.InteropServices.Marshal]::WriteInt32($class, 0, 80)
+            [Runtime.InteropServices.Marshal]::WriteInt32($class, 4, 0x0020) # CS_OWNDC: the device context is kept for the window's life.
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 8, [Win32]::Export('user32.dll', 'DefWindowProcW'))
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 24, $this.Module)
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 32, $icon)
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 40, $this.LoadCursorW.Invoke([IntPtr]::Zero, [IntPtr]32512))
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 48, $this.GetStockObject.Invoke(4)) # BLACK_BRUSH, which the backdrop shows through.
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 64, $this.ClassName)
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 72, $icon)
+            if ($this.RegisterClassExW.Invoke($class) -eq 0) { throw 'PSNES could not register its window class.' }
+        } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($class) }
+
+        $text = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($title)
+        try {
+            # WS_OVERLAPPEDWINDOW at CW_USEDEFAULT.
+            $this.Handle = $this.CreateWindowExW.Invoke([uint32]0, $this.ClassName, $text, [uint32]0x00CF0000, [int]::MinValue, [int]::MinValue, $wide, $tall, [IntPtr]::Zero, [IntPtr]::Zero, $this.Module, [IntPtr]::Zero)
+        } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($text) }
+        if ($this.Handle -eq [IntPtr]::Zero) { throw 'PSNES could not create its window.' }
+
+        $value = [Runtime.InteropServices.Marshal]::AllocHGlobal(16)
+        try {
+            # Dark title bar (DWMWA_USE_IMMERSIVE_DARK_MODE) and no outline (DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE).
+            # Builds that lack an attribute answer E_INVALIDARG, which leaves the default.
+            foreach ($attribute in @(@(20, 1), @(34, -2))) {
+                [Runtime.InteropServices.Marshal]::WriteInt32($value, $attribute[1])
+                [int] $result = $this.DwmSetWindowAttribute.Invoke($this.Handle, [uint32]$attribute[0], $value, [uint32]4)
+                if ($result -lt 0 -and $result -ne -2147024809) { throw "DwmSetWindowAttribute $($attribute[0]) failed: $result" }
+            }
+            if ([Environment]::OSVersion.Version.Build -ge 22621) {
+                # Mica (DWMWA_SYSTEMBACKDROP_TYPE = DWMSBT_MAINWINDOW), extended over the whole client area.
+                [Runtime.InteropServices.Marshal]::WriteInt32($value, 2)
+                [int] $result = $this.DwmSetWindowAttribute.Invoke($this.Handle, [uint32]38, $value, [uint32]4)
+                if ($result -lt 0) { throw "DWM backdrop failed: $result" }
+                foreach ($offset in 0, 4, 8, 12) { [Runtime.InteropServices.Marshal]::WriteInt32($value, $offset, -1) }
+                $result = $this.DwmExtendFrameIntoClientArea.Invoke($this.Handle, $value)
+                if ($result -lt 0) { throw "DWM frame extension failed: $result" }
+            }
+        } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($value) }
+
+        # The first ShowWindow may honour the launcher's STARTUPINFO instead of SW_SHOW.
+        [void]$this.ShowWindow.Invoke($this.Handle, 5)
+        [void]$this.ShowWindow.Invoke($this.Handle, 5)
+        [void]$this.SetForegroundWindow.Invoke($this.Handle)
+        $this.Device = $this.GetDC.Invoke($this.Handle)
+        $this.Layout()
+    }
+
+    # Integer scale, centred. A changed client area needs a full redraw.
+    [void] Layout() {
+        [void]$this.GetClientRect.Invoke($this.Handle, $this.Rect)
+        [int] $wide = [Runtime.InteropServices.Marshal]::ReadInt32($this.Rect, 8)
+        [int] $tall = [Runtime.InteropServices.Marshal]::ReadInt32($this.Rect, 12)
+        if ($wide -eq $this.ClientWide -and $tall -eq $this.ClientTall) { return }
+        $this.ClientWide = $wide; $this.ClientTall = $tall
+        $this.Scale = [Math]::Max(1, [Math]::Min([Math]::Floor($wide / 256), [Math]::Floor($tall / 240)))
+        $this.OriginX = [int](($wide - 256 * $this.Scale) / 2)
+        $this.OriginY = [int](($tall - 240 * $this.Scale) / 2)
+        $this.FullDraw = $true
+    }
+
+    # Drains the queue. Anything Windows asked to repaint gets a full redraw. False once the window is closed.
+    [bool] Pump() {
+        while ($this.PeekMessageW.Invoke($this.Message, [IntPtr]::Zero, [uint32]0, [uint32]0, [uint32]1) -ne 0) {
+            if ([Runtime.InteropServices.Marshal]::ReadInt32($this.Message, 8) -eq 0x000F) { $this.FullDraw = $true; $this.Repaints++ }
+            [void]$this.TranslateMessage.Invoke($this.Message)
+            [void]$this.DispatchMessageW.Invoke($this.Message)
+        }
+        if ($this.IsWindow.Invoke($this.Handle) -eq 0) { return $false }
+        $this.Layout()
+        return $true
+    }
+
+    # Controller 1 from the keyboard, while this window has focus.
+    [byte] Buttons() {
+        if ($this.GetForegroundWindow.Invoke() -ne $this.Handle) { return 0 }
+        [int] $buttons = 0
+        for ([int] $bit = 0; $bit -lt 8; $bit++) {
+            if (([int]$this.GetAsyncKeyState.Invoke([NesWindow]::Keys[$bit]) -band 0x8000) -ne 0) { $buttons = $buttons -bor (1 -shl $bit) }
+        }
+        return [byte]$buttons
+    }
+
+    [void] Present([byte[]] $pixels) {
+        [int] $slot = $this.Frames % 3
+        $this.Frames++
+        [bool] $full = $this.FullDraw
+        # Dirty rectangles assume the screen still shows the last frame. Windows can erase it without
+        # a message reaching this loop, so sample the screen against that frame and heal with a full redraw.
+        if (-not $full) {
+            $shown = $this.Ring[($slot + 2) % 3]
+            foreach ($y in 8, 60, 120, 180, 232) {
+                foreach ($x in 8, 70, 128, 190, 248) {
+                    [uint32] $reading = $this.GetPixel.Invoke($this.Device, $this.OriginX + $x * $this.Scale + [int]($this.Scale / 2), $this.OriginY + $y * $this.Scale + [int]($this.Scale / 2))
+                    # CLR_INVALID: this point cannot be read now, which is not a mismatch.
+                    if ($reading -eq [uint32]::MaxValue) { continue }
+                    [int] $onScreen = [int]$reading
+                    [int] $asBuffer = (($onScreen -band 0xFF) -shl 16) -bor ($onScreen -band 0xFF00) -bor (($onScreen -shr 16) -band 0xFF)
+                    if ($asBuffer -ne ($shown[$y * 256 + $x] -band 0xFFFFFF)) { $full = $true; break }
+                }
+                if ($full) { $this.Healed++; break }
+            }
+        }
+        [NesBlit]::Convert($pixels, $this.Colors, $this.Ring[$slot])
+        [NesBlit]::Damage($this.Ring[($slot + 1) % 3], $this.Ring[($slot + 2) % 3], $this.Ring[$slot], $this.Facts)
+        if ($this.Facts[0] -eq 0 -and -not $full) { $this.Skipped++; return }
+        [int] $sourceX = 0; [int] $sourceY = 0; [int] $spanX = 256; [int] $spanY = 240
+        if (-not $full) {
+            $sourceX = $this.Facts[2]; $sourceY = $this.Facts[3]
+            $spanX = $this.Facts[4] - $this.Facts[2] + 1; $spanY = $this.Facts[5] - $this.Facts[3] + 1
+        }
+        [int] $lines = $this.StretchDIBits.Invoke($this.Device,
+            $this.OriginX + $sourceX * $this.Scale, $this.OriginY + $sourceY * $this.Scale, $spanX * $this.Scale, $spanY * $this.Scale,
+            $sourceX, 240 - $sourceY - $spanY, $spanX, $spanY,
+            $this.Pins[$slot].AddrOfPinnedObject(), $this.Header, [uint32]0, [uint32]0x00CC0020)
+        if ($lines -gt 0) { $this.Drawn++; $this.FullDraw = $false }
+    }
+
+    [void] Close() {
+        if ($this.Device -ne [IntPtr]::Zero) { [void]$this.ReleaseDC.Invoke($this.Handle, $this.Device); $this.Device = [IntPtr]::Zero }
+        if ($this.Handle -ne [IntPtr]::Zero -and $this.IsWindow.Invoke($this.Handle) -ne 0) { [void]$this.DestroyWindow.Invoke($this.Handle) }
+        $this.Handle = [IntPtr]::Zero
+        if ($this.ClassName -ne [IntPtr]::Zero) {
+            [void]$this.UnregisterClassW.Invoke($this.ClassName, $this.Module)
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($this.ClassName); $this.ClassName = [IntPtr]::Zero
+        }
+        foreach ($pin in $this.Pins) { if ($pin.IsAllocated) { $pin.Free() } }
+        foreach ($block in $this.Header, $this.Message, $this.Rect) { if ($block -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($block) } }
+        $this.Header = [IntPtr]::Zero; $this.Message = [IntPtr]::Zero; $this.Rect = [IntPtr]::Zero
+    }
+}
+
+# Plays an iNES image in a window until the window is closed.
+function Invoke-PSNES([string] $Path) {
+    $nes = [Nes]::new()
+    if (-not $nes.Rom.Load($Path)) { throw "PSNES could not load $Path." }
+    $nes.PowerOn()
+    $window = [NesWindow]::new('PSNES - ' + [IO.Path]::GetFileName($Path), 816, 776)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        while ($window.Pump()) {
+            $nes.Memory.SetControllerState($window.Buttons(), 0)
+            $nes.RunFrame()
+            $window.Present($nes.Ppu.Pixels)
+        }
+    } finally { $window.Close() }
+    [pscustomobject]@{
+        Rom = $Path
+        Frames = $window.Frames
+        Seconds = [Math]::Round($clock.Elapsed.TotalSeconds, 1)
+        FramesPerSecond = [Math]::Round($window.Frames / [Math]::Max(0.001, $clock.Elapsed.TotalSeconds), 2)
+        Drawn = $window.Drawn
+        Skipped = $window.Skipped
+        Healed = $window.Healed
+        Repaints = $window.Repaints
     }
 }
 
@@ -2692,18 +2971,6 @@ if ($MyInvocation.InvocationName -ne '.') {
         return
     }
 
-    if ($PSBoundParameters.Count -eq 0) {
-        Write-Warning @'
-PSNES cannot start an emulator session by itself because no host capabilities
-were supplied.
-
-PSNES includes a deterministic conformance suite that can run without a host.
-'@
-
-        $Answer = Read-Host 'Run conformance instead? [Y/N]'
-        if ($Answer -match '^(?i:y|yes)$') {
-            Test-PSNESConformance
-        }
-        return
-    }
+    if (-not $Rom) { throw 'Pass -Rom with the path of an iNES image to play, or -Conformance to run the conformance suite.' }
+    Invoke-PSNES -Path $Rom
 }
