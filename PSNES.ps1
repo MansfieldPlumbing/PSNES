@@ -6,6 +6,8 @@ using namespace System.IO
 param(
     # An iNES image to play in a window.
     [string] $Rom,
+    # How the frame fills the window. Tab cycles the modes while playing.
+    [ValidateSet('Fit', 'Stretch', 'Blur')] [string] $Scaling = 'Fit',
     # Run the built-in conformance suite instead.
     [switch] $Conformance
 )
@@ -431,24 +433,6 @@ class Ppu {
                     $this.Sprite0Line = -1
                     $this.FrameEnded = $true
                 }
-            }
-        }
-    }
-
-    [void] Step([ref] $nmi) {
-        $this.Cycle++
-        if ($this.Cycle -ge 341) {
-            $this.Cycle = 0
-            $this.Scanline++
-            
-            if ($this.Scanline -eq 241) {
-                $this.Status = $this.Status -bor 0x80 # Set VBLANK
-                if (($this.Ctrl -band 0x80) -ne 0) {
-                    $nmi.Value = $true
-                }
-            } elseif ($this.Scanline -eq 261) {
-                $this.Scanline = -1
-                $this.Status = $this.Status -band 0x7F # Clear VBLANK
             }
         }
     }
@@ -2514,6 +2498,33 @@ class Nes {
     }
 }
 
+# Headless runs: PsnesBench <rom> <frames> runs that many frames with no window, then prints the frame count, the
+# milliseconds taken and a checksum of RAM. The entry point of the native build; the same method runs interpreted.
+class PsnesBench {
+    static [int] Main([string[]] $arguments) {
+        if ($arguments.Length -ne 2) { [Console]::WriteLine('usage: PsnesBench <rom> <frames>'); return 2 }
+        $nes = [Nes]::new()
+        if (-not $nes.Rom.Load($arguments[0])) { [Console]::WriteLine('The ROM did not load.'); return 1 }
+        $nes.PowerOn()
+        [int] $frames = [int]::Parse($arguments[1])
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        for ([int] $frame = 0; $frame -lt $frames; $frame++) { $nes.RunFrame() }
+        $clock.Stop()
+        [Console]::WriteLine('{0} frames in {1} ms; RAM checksum {2:X16}', $frames, $clock.ElapsedMilliseconds, [PsnesBench]::Checksum($nes.Memory.Ram))
+        return 0
+    }
+
+    # Rotate left by 5, then xor the next byte: a short fingerprint of a machine state, for comparing two runs.
+    # Shifts never overflow, so this means the same interpreted and lowered.
+    static [ulong] Checksum([byte[]] $bytes) {
+        [ulong] $hash = 0
+        for ([int] $i = 0; $i -lt $bytes.Length; $i++) {
+            $hash = (($hash -shl 5) -bor ($hash -shr 59)) -bxor $bytes[$i]
+        }
+        return $hash
+    }
+}
+
 # ============================================================================
 # WINDOW
 # ============================================================================
@@ -2579,10 +2590,59 @@ class NesBlit {
         }
         $stats[0] = $changed; $stats[1] = $returned; $stats[2] = $left; $stats[3] = $top; $stats[4] = $right; $stats[5] = $bottom
     }
+
+    # The frame scaled to cover a small buffer (cropped, aspect kept), blurred and dimmed to 60%.
+    # Drawn stretched behind the game, it fills the sides with the game's own colours.
+    static [void] Glow([int[]] $frame, [int[]] $glow, [int] $wide, [int] $tall) {
+        [int] $count = $wide * $tall
+        [int[]] $red = [int[]]::new($count); [int[]] $green = [int[]]::new($count); [int[]] $blue = [int[]]::new($count)
+        [int[]] $scratch = [int[]]::new($count)
+        [double] $cover = [Math]::Max($wide / 256.0, $tall / 240.0)
+        [int] $at = 0
+        for ([int] $y = 0; $y -lt $tall; $y++) {
+            [int] $sy = [Math]::Min(239, [Math]::Max(0, [int][Math]::Floor(($y + 0.5 - $tall / 2.0) / $cover + 120.0)))
+            for ([int] $x = 0; $x -lt $wide; $x++) {
+                [int] $sx = [Math]::Min(255, [Math]::Max(0, [int][Math]::Floor(($x + 0.5 - $wide / 2.0) / $cover + 128.0)))
+                [int] $value = $frame[$sy * 256 + $sx]
+                $red[$at] = ($value -shr 16) -band 0xFF; $green[$at] = ($value -shr 8) -band 0xFF; $blue[$at] = $value -band 0xFF
+                $at++
+            }
+        }
+        foreach ($plane in $red, $green, $blue) {
+            for ([int] $pass = 0; $pass -lt 2; $pass++) { [NesBlit]::Box($plane, $scratch, $wide, $tall, 2) }
+        }
+        for ([int] $i = 0; $i -lt $count; $i++) {
+            $glow[$i] = [int](0xFF000000 -bor ((($red[$i] * 3) / 5) -shl 16) -bor ((($green[$i] * 3) / 5) -shl 8) -bor (($blue[$i] * 3) / 5))
+        }
+    }
+
+    # Box blur of one plane, horizontal then vertical, with running sums and edges held.
+    static [void] Box([int[]] $plane, [int[]] $scratch, [int] $wide, [int] $tall, [int] $radius) {
+        [int] $span = 2 * $radius + 1
+        for ([int] $y = 0; $y -lt $tall; $y++) {
+            [int] $row = $y * $wide
+            [int] $sum = 0
+            for ([int] $k = -$radius; $k -le $radius; $k++) { $sum += $plane[$row + [Math]::Min($wide - 1, [Math]::Max(0, $k))] }
+            for ([int] $x = 0; $x -lt $wide; $x++) {
+                $scratch[$row + $x] = [int][Math]::Floor($sum / $span)
+                $sum += $plane[$row + [Math]::Min($wide - 1, $x + $radius + 1)] - $plane[$row + [Math]::Max(0, $x - $radius)]
+            }
+        }
+        for ([int] $x = 0; $x -lt $wide; $x++) {
+            [int] $sum = 0
+            for ([int] $k = -$radius; $k -le $radius; $k++) { $sum += $scratch[[Math]::Min($tall - 1, [Math]::Max(0, $k)) * $wide + $x] }
+            for ([int] $y = 0; $y -lt $tall; $y++) {
+                $plane[$y * $wide + $x] = [int][Math]::Floor($sum / $span)
+                $sum += $scratch[[Math]::Min($tall - 1, $y + $radius + 1) * $wide + $x] - $scratch[[Math]::Max(0, $y - $radius) * $wide + $x]
+            }
+        }
+    }
 }
 
-# A Windows 11 window with a system backdrop. Frames go through a ring of three buffers:
-# only the rectangle that changed reaches GDI, and frames that did not change are skipped.
+# A Windows 11 window with a system backdrop. Its messages are pumped on a thread of its own, so
+# dragging or resizing never stops the game; the game thread draws into the window through GDI.
+# Frames go through a ring of three buffers: only the rectangle that changed reaches GDI, and
+# frames that did not change are skipped.
 class NesWindow {
     # FCEUX's NES palette, 0xRRGGBB per colour index.
     static [int[]] $Palette = @(
@@ -2592,95 +2652,115 @@ class NesWindow {
         0xFCFCFC, 0xA8E4FC, 0xC4D4FC, 0xD4C8FC, 0xFCC4FC, 0xFCC4D8, 0xFCBCB0, 0xFCD8A8, 0xFCE4A0, 0xE0FCA0, 0xA8F0BC, 0xB0FCCC, 0x9CFCF0, 0xC4C4C4, 0x000000, 0x000000)
     # Virtual-key code for each controller bit, A B Select Start Up Down Left Right: X Z RShift Enter and the arrows.
     static [int[]] $Keys = @(0x58, 0x5A, 0xA1, 0x0D, 0x26, 0x28, 0x25, 0x27)
+    # Tab cycles these. Fit keeps the aspect ratio at any scale; Stretch fills the window;
+    # Blur is Fit with the sides filled by a dimmed, blurred copy of the frame.
+    static [string[]] $Modes = @('Fit', 'Stretch', 'Blur')
 
     [IntPtr] $Handle
     [IntPtr] $Device
     [IntPtr] $Module
     [IntPtr] $ClassName
-    [IntPtr] $Header
+    [IntPtr] $Title
+    [IntPtr] $Published
     [IntPtr] $Message
+    [IntPtr] $Header
+    [IntPtr] $GlowHeader
     [IntPtr] $Rect
+    [IntPtr] $Backdrop
+    [Threading.Thread] $Pump
+    [Threading.ThreadStart] $PumpEntry
+    [string] $Scaling
     [int] $ClientWide
     [int] $ClientTall
-    [int] $Scale = 1
+    [double] $ScaleX = 1.0
+    [double] $ScaleY = 1.0
     [int] $OriginX
     [int] $OriginY
+    [int] $DrawWide
+    [int] $DrawTall
     [int[]] $Colors = [int[]]::new(64)
     [int[][]] $Ring = @([int[]]::new(61440), [int[]]::new(61440), [int[]]::new(61440))
     [Runtime.InteropServices.GCHandle[]] $Pins = [Runtime.InteropServices.GCHandle[]]::new(3)
+    [int[]] $Glow
+    [Runtime.InteropServices.GCHandle] $GlowPin
+    [int] $GlowWide
+    [int] $GlowTall
     [int[]] $Facts = [int[]]::new(6)
     [bool] $FullDraw = $true
+    [bool] $TabWasDown
     [int] $Frames
     [int] $Drawn
     [int] $Skipped
     [int] $Healed
-    [int] $Repaints
 
     hidden [Delegate] $RegisterClassExW = [Win32]::Bind('user32.dll', 'RegisterClassExW', [uint16], [Type[]]@([IntPtr]))
     hidden [Delegate] $UnregisterClassW = [Win32]::Bind('user32.dll', 'UnregisterClassW', [int], [Type[]]@([IntPtr], [IntPtr]))
-    hidden [Delegate] $CreateWindowExW = [Win32]::Bind('user32.dll', 'CreateWindowExW', [IntPtr], [Type[]]@([uint32], [IntPtr], [IntPtr], [uint32], [int], [int], [int], [int], [IntPtr], [IntPtr], [IntPtr], [IntPtr]))
-    hidden [Delegate] $DestroyWindow = [Win32]::Bind('user32.dll', 'DestroyWindow', [int], [Type[]]@([IntPtr]))
     hidden [Delegate] $IsWindow = [Win32]::Bind('user32.dll', 'IsWindow', [int], [Type[]]@([IntPtr]))
     hidden [Delegate] $ShowWindow = [Win32]::Bind('user32.dll', 'ShowWindow', [int], [Type[]]@([IntPtr], [int]))
+    hidden [Delegate] $PostMessageW = [Win32]::Bind('user32.dll', 'PostMessageW', [int], [Type[]]@([IntPtr], [uint32], [IntPtr], [IntPtr]))
     hidden [Delegate] $SetForegroundWindow = [Win32]::Bind('user32.dll', 'SetForegroundWindow', [int], [Type[]]@([IntPtr]))
     hidden [Delegate] $GetForegroundWindow = [Win32]::Bind('user32.dll', 'GetForegroundWindow', [IntPtr], [Type[]]@())
-    hidden [Delegate] $PeekMessageW = [Win32]::Bind('user32.dll', 'PeekMessageW', [int], [Type[]]@([IntPtr], [IntPtr], [uint32], [uint32], [uint32]))
-    hidden [Delegate] $TranslateMessage = [Win32]::Bind('user32.dll', 'TranslateMessage', [int], [Type[]]@([IntPtr]))
-    hidden [Delegate] $DispatchMessageW = [Win32]::Bind('user32.dll', 'DispatchMessageW', [IntPtr], [Type[]]@([IntPtr]))
     hidden [Delegate] $LoadCursorW = [Win32]::Bind('user32.dll', 'LoadCursorW', [IntPtr], [Type[]]@([IntPtr], [IntPtr]))
     hidden [Delegate] $LoadIconW = [Win32]::Bind('user32.dll', 'LoadIconW', [IntPtr], [Type[]]@([IntPtr], [IntPtr]))
     hidden [Delegate] $GetClientRect = [Win32]::Bind('user32.dll', 'GetClientRect', [int], [Type[]]@([IntPtr], [IntPtr]))
     hidden [Delegate] $GetDC = [Win32]::Bind('user32.dll', 'GetDC', [IntPtr], [Type[]]@([IntPtr]))
-    hidden [Delegate] $ReleaseDC = [Win32]::Bind('user32.dll', 'ReleaseDC', [int], [Type[]]@([IntPtr], [IntPtr]))
+    hidden [Delegate] $FillRect = [Win32]::Bind('user32.dll', 'FillRect', [int], [Type[]]@([IntPtr], [IntPtr], [IntPtr]))
     hidden [Delegate] $GetAsyncKeyState = [Win32]::Bind('user32.dll', 'GetAsyncKeyState', [int16], [Type[]]@([int]))
     hidden [Delegate] $GetModuleHandleW = [Win32]::Bind('kernel32.dll', 'GetModuleHandleW', [IntPtr], [Type[]]@([IntPtr]))
     hidden [Delegate] $GetStockObject = [Win32]::Bind('gdi32.dll', 'GetStockObject', [IntPtr], [Type[]]@([int]))
     hidden [Delegate] $GetPixel = [Win32]::Bind('gdi32.dll', 'GetPixel', [uint32], [Type[]]@([IntPtr], [int], [int]))
+    hidden [Delegate] $SetStretchBltMode = [Win32]::Bind('gdi32.dll', 'SetStretchBltMode', [int], [Type[]]@([IntPtr], [int]))
     hidden [Delegate] $StretchDIBits = [Win32]::Bind('gdi32.dll', 'StretchDIBits', [int], [Type[]]@([IntPtr], [int], [int], [int], [int], [int], [int], [int], [int], [IntPtr], [IntPtr], [uint32], [uint32]))
     hidden [Delegate] $DwmSetWindowAttribute = [Win32]::Bind('dwmapi.dll', 'DwmSetWindowAttribute', [int], [Type[]]@([IntPtr], [uint32], [IntPtr], [uint32]))
     hidden [Delegate] $DwmExtendFrameIntoClientArea = [Win32]::Bind('dwmapi.dll', 'DwmExtendFrameIntoClientArea', [int], [Type[]]@([IntPtr], [IntPtr]))
 
-    NesWindow([string] $title, [int] $wide, [int] $tall) {
+    NesWindow([string] $title, [int] $wide, [int] $tall, [string] $scaling) {
+        $this.Scaling = $scaling
         # Alpha must be FF: the backdrop extends the frame over the client area, so the compositor
         # reads alpha there and treats 00 as see-through. GetPixel sees only RGB and cannot catch it.
         for ([int] $c = 0; $c -lt 64; $c++) { $this.Colors[$c] = [int](0xFF000000 -bor [NesWindow]::Palette[$c]) }
         for ([int] $b = 0; $b -lt 3; $b++) { $this.Pins[$b] = [Runtime.InteropServices.GCHandle]::Alloc($this.Ring[$b], [Runtime.InteropServices.GCHandleType]::Pinned) }
         $this.Message = [Runtime.InteropServices.Marshal]::AllocHGlobal(48)
         $this.Rect = [Runtime.InteropServices.Marshal]::AllocHGlobal(16)
-        # BITMAPINFOHEADER: 256 wide, 240 tall top-down, one plane, 32 bits, BI_RGB.
-        $this.Header = [Runtime.InteropServices.Marshal]::AllocHGlobal(44)
-        [Runtime.InteropServices.Marshal]::Copy([byte[]]::new(44), 0, $this.Header, 44)
-        [Runtime.InteropServices.Marshal]::WriteInt32($this.Header, 0, 40)
-        [Runtime.InteropServices.Marshal]::WriteInt32($this.Header, 4, 256)
-        [Runtime.InteropServices.Marshal]::WriteInt32($this.Header, 8, -240)
-        [Runtime.InteropServices.Marshal]::WriteInt16($this.Header, 12, 1)
-        [Runtime.InteropServices.Marshal]::WriteInt16($this.Header, 14, 32)
+        $this.Published = [Runtime.InteropServices.Marshal]::AllocHGlobal(8)
+        [Runtime.InteropServices.Marshal]::WriteIntPtr($this.Published, [IntPtr]::new(-1))
+        $this.Header = [NesWindow]::NewBitmapHeader(256, 240)
+        $this.GlowHeader = [NesWindow]::NewBitmapHeader(1, 1)
 
-        # WNDCLASSEXW, 80 bytes. The window procedure is DefWindowProcW itself: closing destroys
-        # the window, and the frame loop sees that through IsWindow.
+        # WNDCLASSEXW, 80 bytes. The window procedure is DefWindowProcW itself. There is no class
+        # brush, so Windows never erases what the game thread draws; Layout clears to the backdrop.
         $this.Module = $this.GetModuleHandleW.Invoke([IntPtr]::Zero)
         $this.ClassName = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('PSNES')
+        $this.Backdrop = $this.GetStockObject.Invoke(4) # BLACK_BRUSH: alpha 0, so the backdrop shows through.
         $icon = $this.LoadIconW.Invoke([IntPtr]::Zero, [IntPtr]32512)
         $class = [Runtime.InteropServices.Marshal]::AllocHGlobal(80)
         try {
             [Runtime.InteropServices.Marshal]::Copy([byte[]]::new(80), 0, $class, 80)
             [Runtime.InteropServices.Marshal]::WriteInt32($class, 0, 80)
-            [Runtime.InteropServices.Marshal]::WriteInt32($class, 4, 0x0020) # CS_OWNDC: the device context is kept for the window's life.
+            [Runtime.InteropServices.Marshal]::WriteInt32($class, 4, 0x0020) # CS_OWNDC: one device context for the window's life.
             [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 8, [Win32]::Export('user32.dll', 'DefWindowProcW'))
             [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 24, $this.Module)
             [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 32, $icon)
             [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 40, $this.LoadCursorW.Invoke([IntPtr]::Zero, [IntPtr]32512))
-            [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 48, $this.GetStockObject.Invoke(4)) # BLACK_BRUSH, which the backdrop shows through.
             [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 64, $this.ClassName)
             [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 72, $icon)
             if ($this.RegisterClassExW.Invoke($class) -eq 0) { throw 'PSNES could not register its window class.' }
         } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($class) }
 
-        $text = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($title)
-        try {
-            # WS_OVERLAPPEDWINDOW at CW_USEDEFAULT.
-            $this.Handle = $this.CreateWindowExW.Invoke([uint32]0, $this.ClassName, $text, [uint32]0x00CF0000, [int]::MinValue, [int]::MinValue, $wide, $tall, [IntPtr]::Zero, [IntPtr]::Zero, $this.Module, [IntPtr]::Zero)
-        } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($text) }
+        # A window belongs to the thread that creates it, so the pump thread creates it, publishes
+        # the handle, and pumps until the window is gone.
+        $this.Title = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($title)
+        $this.PumpEntry = $this.BuildPump($wide, $tall)
+        $this.Pump = [Threading.Thread]::new($this.PumpEntry)
+        $this.Pump.IsBackground = $true
+        $this.Pump.Name = 'PSNES window'
+        $this.Pump.Start()
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        while ([Runtime.InteropServices.Marshal]::ReadIntPtr($this.Published) -eq [IntPtr]::new(-1)) {
+            if ($clock.Elapsed.TotalSeconds -gt 10) { throw 'The PSNES window thread did not start.' }
+            [Threading.Thread]::Sleep(1)
+        }
+        $this.Handle = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.Published)
         if ($this.Handle -eq [IntPtr]::Zero) { throw 'PSNES could not create its window.' }
 
         $value = [Runtime.InteropServices.Marshal]::AllocHGlobal(16)
@@ -2708,37 +2788,126 @@ class NesWindow {
         [void]$this.ShowWindow.Invoke($this.Handle, 5)
         [void]$this.SetForegroundWindow.Invoke($this.Handle)
         $this.Device = $this.GetDC.Invoke($this.Handle)
-        $this.Layout()
+        $this.Layout($true)
     }
 
-    # Integer scale, centred. A changed client area needs a full redraw.
-    [void] Layout() {
+    # BITMAPINFOHEADER for a top-down 32-bit BI_RGB bitmap.
+    static [IntPtr] NewBitmapHeader([int] $wide, [int] $tall) {
+        $bitmapInfo = [Runtime.InteropServices.Marshal]::AllocHGlobal(44)
+        [Runtime.InteropServices.Marshal]::Copy([byte[]]::new(44), 0, $bitmapInfo, 44)
+        [Runtime.InteropServices.Marshal]::WriteInt32($bitmapInfo, 0, 40)
+        [Runtime.InteropServices.Marshal]::WriteInt32($bitmapInfo, 4, $wide)
+        [Runtime.InteropServices.Marshal]::WriteInt32($bitmapInfo, 8, -$tall)
+        [Runtime.InteropServices.Marshal]::WriteInt16($bitmapInfo, 12, 1)
+        [Runtime.InteropServices.Marshal]::WriteInt16($bitmapInfo, 14, 32)
+        return $bitmapInfo
+    }
+
+    # The pump thread's body, emitted as IL that calls user32 directly, so no PowerShell runs on that
+    # thread and it needs no runspace:
+    #   hwnd = CreateWindowExW(...); *Published = hwnd
+    #   while (hwnd && GetMessageW(msg) > 0) { TranslateMessage(msg); DispatchMessageW(msg); if (!IsWindow(hwnd)) break }
+    hidden [Threading.ThreadStart] BuildPump([int] $wide, [int] $tall) {
+        $method = [Reflection.Emit.DynamicMethod]::new('PSNESWindowPump', [void], [Type[]]@())
+        $il = $method.GetILGenerator()
+        $window = $il.DeclareLocal([IntPtr])
+        $loop = $il.DefineLabel(); $done = $il.DefineLabel()
+        $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+        [NesWindow]::EmitPointer($il, $this.ClassName)
+        [NesWindow]::EmitPointer($il, $this.Title)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, 0x00CF0000) # WS_OVERLAPPEDWINDOW
+        $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]::MinValue) # CW_USEDEFAULT
+        $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]::MinValue)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, $wide)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4, $tall)
+        [NesWindow]::EmitPointer($il, [IntPtr]::Zero)
+        [NesWindow]::EmitPointer($il, [IntPtr]::Zero)
+        [NesWindow]::EmitPointer($il, $this.Module)
+        [NesWindow]::EmitPointer($il, [IntPtr]::Zero)
+        [NesWindow]::EmitCall($il, 'CreateWindowExW', [IntPtr], [Type[]]@([uint32], [IntPtr], [IntPtr], [uint32], [int], [int], [int], [int], [IntPtr], [IntPtr], [IntPtr], [IntPtr]))
+        $il.Emit([Reflection.Emit.OpCodes]::Stloc, $window)
+        [NesWindow]::EmitPointer($il, $this.Published)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $window)
+        $il.Emit([Reflection.Emit.OpCodes]::Stind_I)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $window)
+        $il.Emit([Reflection.Emit.OpCodes]::Brfalse, $done)
+        $il.MarkLabel($loop)
+        [NesWindow]::EmitPointer($il, $this.Message)
+        [NesWindow]::EmitPointer($il, [IntPtr]::Zero)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+        [NesWindow]::EmitCall($il, 'GetMessageW', [int], [Type[]]@([IntPtr], [IntPtr], [uint32], [uint32]))
+        $il.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
+        $il.Emit([Reflection.Emit.OpCodes]::Ble, $done)
+        [NesWindow]::EmitPointer($il, $this.Message)
+        [NesWindow]::EmitCall($il, 'TranslateMessage', [int], [Type[]]@([IntPtr]))
+        $il.Emit([Reflection.Emit.OpCodes]::Pop)
+        [NesWindow]::EmitPointer($il, $this.Message)
+        [NesWindow]::EmitCall($il, 'DispatchMessageW', [IntPtr], [Type[]]@([IntPtr]))
+        $il.Emit([Reflection.Emit.OpCodes]::Pop)
+        $il.Emit([Reflection.Emit.OpCodes]::Ldloc, $window)
+        [NesWindow]::EmitCall($il, 'IsWindow', [int], [Type[]]@([IntPtr]))
+        $il.Emit([Reflection.Emit.OpCodes]::Brtrue, $loop)
+        $il.MarkLabel($done)
+        $il.Emit([Reflection.Emit.OpCodes]::Ret)
+        return [Threading.ThreadStart]$method.CreateDelegate([Threading.ThreadStart])
+    }
+
+    hidden static [void] EmitPointer([Reflection.Emit.ILGenerator] $il, [IntPtr] $value) {
+        $il.Emit([Reflection.Emit.OpCodes]::Ldc_I8, $value.ToInt64())
+        $il.Emit([Reflection.Emit.OpCodes]::Conv_I)
+    }
+
+    hidden static [void] EmitCall([Reflection.Emit.ILGenerator] $il, [string] $name, [Type] $returnType, [Type[]] $parameterTypes) {
+        [NesWindow]::EmitPointer($il, [Win32]::Export('user32.dll', $name))
+        $il.EmitCalli([Reflection.Emit.OpCodes]::Calli, [Runtime.InteropServices.CallingConvention]::StdCall, $returnType, $parameterTypes)
+    }
+
+    # Places the frame for the current mode. A changed client area is cleared to the backdrop and
+    # fully redrawn, so nothing drawn at an old size or origin stays on screen.
+    [void] Layout([bool] $force) {
         [void]$this.GetClientRect.Invoke($this.Handle, $this.Rect)
         [int] $wide = [Runtime.InteropServices.Marshal]::ReadInt32($this.Rect, 8)
         [int] $tall = [Runtime.InteropServices.Marshal]::ReadInt32($this.Rect, 12)
-        if ($wide -eq $this.ClientWide -and $tall -eq $this.ClientTall) { return }
+        if (-not $force -and $wide -eq $this.ClientWide -and $tall -eq $this.ClientTall) { return }
         $this.ClientWide = $wide; $this.ClientTall = $tall
-        $this.Scale = [Math]::Max(1, [Math]::Min([Math]::Floor($wide / 256), [Math]::Floor($tall / 240)))
-        $this.OriginX = [int](($wide - 256 * $this.Scale) / 2)
-        $this.OriginY = [int](($tall - 240 * $this.Scale) / 2)
+        if ($wide -le 0 -or $tall -le 0) { return }
+        [void]$this.FillRect.Invoke($this.Device, $this.Rect, $this.Backdrop)
+        if ($this.Scaling -eq 'Stretch') {
+            $this.ScaleX = $wide / 256.0; $this.ScaleY = $tall / 240.0
+        } else {
+            $this.ScaleX = [Math]::Min($wide / 256.0, $tall / 240.0); $this.ScaleY = $this.ScaleX
+        }
+        $this.DrawWide = [int][Math]::Floor(256 * $this.ScaleX); $this.DrawTall = [int][Math]::Floor(240 * $this.ScaleY)
+        $this.OriginX = [int][Math]::Floor(($wide - $this.DrawWide) / 2); $this.OriginY = [int][Math]::Floor(($tall - $this.DrawTall) / 2)
+        if ($this.Scaling -eq 'Blur') {
+            # One glow pixel per 32x32 of the window. Interpreted, 8x8 cost 3.3 s per frame at 1920x1080.
+            $this.GlowWide = [Math]::Max(1, [int][Math]::Ceiling($wide / 32)); $this.GlowTall = [Math]::Max(1, [int][Math]::Ceiling($tall / 32))
+            if ($this.GlowPin.IsAllocated) { $this.GlowPin.Free() }
+            $this.Glow = [int[]]::new($this.GlowWide * $this.GlowTall)
+            $this.GlowPin = [Runtime.InteropServices.GCHandle]::Alloc($this.Glow, [Runtime.InteropServices.GCHandleType]::Pinned)
+            [Runtime.InteropServices.Marshal]::WriteInt32($this.GlowHeader, 4, $this.GlowWide)
+            [Runtime.InteropServices.Marshal]::WriteInt32($this.GlowHeader, 8, -$this.GlowTall)
+        }
         $this.FullDraw = $true
     }
 
-    # Drains the queue. Anything Windows asked to repaint gets a full redraw. False once the window is closed.
-    [bool] Pump() {
-        while ($this.PeekMessageW.Invoke($this.Message, [IntPtr]::Zero, [uint32]0, [uint32]0, [uint32]1) -ne 0) {
-            if ([Runtime.InteropServices.Marshal]::ReadInt32($this.Message, 8) -eq 0x000F) { $this.FullDraw = $true; $this.Repaints++ }
-            [void]$this.TranslateMessage.Invoke($this.Message)
-            [void]$this.DispatchMessageW.Invoke($this.Message)
-        }
+    # False once the window is closed.
+    [bool] Alive() {
         if ($this.IsWindow.Invoke($this.Handle) -eq 0) { return $false }
-        $this.Layout()
+        $this.Layout($false)
         return $true
     }
 
-    # Controller 1 from the keyboard, while this window has focus.
-    [byte] Buttons() {
-        if ($this.GetForegroundWindow.Invoke() -ne $this.Handle) { return 0 }
+    # Controller 1 from the keyboard while this window has focus. Tab switches the scaling mode.
+    [byte] ReadControls() {
+        if ($this.GetForegroundWindow.Invoke() -ne $this.Handle) { $this.TabWasDown = $false; return 0 }
+        [bool] $tabDown = ([int]$this.GetAsyncKeyState.Invoke(0x09) -band 0x8000) -ne 0
+        if ($tabDown -and -not $this.TabWasDown) {
+            $this.Scaling = [NesWindow]::Modes[([Array]::IndexOf([NesWindow]::Modes, $this.Scaling) + 1) % [NesWindow]::Modes.Length]
+            $this.Layout($true)
+        }
+        $this.TabWasDown = $tabDown
         [int] $buttons = 0
         for ([int] $bit = 0; $bit -lt 8; $bit++) {
             if (([int]$this.GetAsyncKeyState.Invoke([NesWindow]::Keys[$bit]) -band 0x8000) -ne 0) { $buttons = $buttons -bor (1 -shl $bit) }
@@ -2746,17 +2915,22 @@ class NesWindow {
         return [byte]$buttons
     }
 
+    # Window column and row where a frame column or row begins.
+    [int] Column([int] $x) { return $this.OriginX + [int][Math]::Floor($x * $this.ScaleX) }
+    [int] Row([int] $y) { return $this.OriginY + [int][Math]::Floor($y * $this.ScaleY) }
+
     [void] Present([byte[]] $pixels) {
+        if ($this.ClientWide -le 0 -or $this.ClientTall -le 0) { return }
         [int] $slot = $this.Frames % 3
         $this.Frames++
         [bool] $full = $this.FullDraw
-        # Dirty rectangles assume the screen still shows the last frame. Windows can erase it without
-        # a message reaching this loop, so sample the screen against that frame and heal with a full redraw.
+        # Dirty rectangles assume the screen still shows the last frame. Sample the screen against that
+        # frame and heal with a full redraw if anything else is there.
         if (-not $full) {
             $shown = $this.Ring[($slot + 2) % 3]
             foreach ($y in 8, 60, 120, 180, 232) {
                 foreach ($x in 8, 70, 128, 190, 248) {
-                    [uint32] $reading = $this.GetPixel.Invoke($this.Device, $this.OriginX + $x * $this.Scale + [int]($this.Scale / 2), $this.OriginY + $y * $this.Scale + [int]($this.Scale / 2))
+                    [uint32] $reading = $this.GetPixel.Invoke($this.Device, [int](($this.Column($x) + $this.Column($x + 1)) / 2), [int](($this.Row($y) + $this.Row($y + 1)) / 2))
                     # CLR_INVALID: this point cannot be read now, which is not a mismatch.
                     if ($reading -eq [uint32]::MaxValue) { continue }
                     [int] $onScreen = [int]$reading
@@ -2769,55 +2943,80 @@ class NesWindow {
         [NesBlit]::Convert($pixels, $this.Colors, $this.Ring[$slot])
         [NesBlit]::Damage($this.Ring[($slot + 1) % 3], $this.Ring[($slot + 2) % 3], $this.Ring[$slot], $this.Facts)
         if ($this.Facts[0] -eq 0 -and -not $full) { $this.Skipped++; return }
+        if ($this.Scaling -eq 'Blur') { $this.PresentGlow($this.Ring[$slot]) }
         [int] $sourceX = 0; [int] $sourceY = 0; [int] $spanX = 256; [int] $spanY = 240
         if (-not $full) {
             $sourceX = $this.Facts[2]; $sourceY = $this.Facts[3]
             $spanX = $this.Facts[4] - $this.Facts[2] + 1; $spanY = $this.Facts[5] - $this.Facts[3] + 1
         }
+        [int] $left = $this.Column($sourceX); [int] $top = $this.Row($sourceY)
+        # COLORONCOLOR: whole pixels, never blended, whether enlarging or shrinking.
+        [void]$this.SetStretchBltMode.Invoke($this.Device, 3)
         [int] $lines = $this.StretchDIBits.Invoke($this.Device,
-            $this.OriginX + $sourceX * $this.Scale, $this.OriginY + $sourceY * $this.Scale, $spanX * $this.Scale, $spanY * $this.Scale,
+            $left, $top, $this.Column($sourceX + $spanX) - $left, $this.Row($sourceY + $spanY) - $top,
             $sourceX, 240 - $sourceY - $spanY, $spanX, $spanY,
             $this.Pins[$slot].AddrOfPinnedObject(), $this.Header, [uint32]0, [uint32]0x00CC0020)
         if ($lines -gt 0) { $this.Drawn++; $this.FullDraw = $false }
     }
 
-    [void] Close() {
-        if ($this.Device -ne [IntPtr]::Zero) { [void]$this.ReleaseDC.Invoke($this.Handle, $this.Device); $this.Device = [IntPtr]::Zero }
-        if ($this.Handle -ne [IntPtr]::Zero -and $this.IsWindow.Invoke($this.Handle) -ne 0) { [void]$this.DestroyWindow.Invoke($this.Handle) }
-        $this.Handle = [IntPtr]::Zero
-        if ($this.ClassName -ne [IntPtr]::Zero) {
-            [void]$this.UnregisterClassW.Invoke($this.ClassName, $this.Module)
-            [Runtime.InteropServices.Marshal]::FreeHGlobal($this.ClassName); $this.ClassName = [IntPtr]::Zero
+    # The four bands around the frame, from the blurred glow.
+    hidden [void] PresentGlow([int[]] $frame) {
+        [NesBlit]::Glow($frame, $this.Glow, $this.GlowWide, $this.GlowTall)
+        [int] $wide = $this.ClientWide; [int] $tall = $this.ClientTall
+        [int] $right = $this.OriginX + $this.DrawWide; [int] $bottom = $this.OriginY + $this.DrawTall
+        # HALFTONE averages when the glow is stretched up.
+        [void]$this.SetStretchBltMode.Invoke($this.Device, 4)
+        # Each band: x, y, width, height. Arithmetic is parenthesized because the comma binds before -.
+        foreach ($band in @(@(0, 0, $wide, $this.OriginY), @(0, $bottom, $wide, ($tall - $bottom)), @(0, $this.OriginY, $this.OriginX, $this.DrawTall), @($right, $this.OriginY, ($wide - $right), $this.DrawTall))) {
+            [int] $x = $band[0]; [int] $y = $band[1]; [int] $w = $band[2]; [int] $h = $band[3]
+            if ($w -le 0 -or $h -le 0) { continue }
+            [int] $gx = [int][Math]::Floor($x * $this.GlowWide / $wide); [int] $gw = [Math]::Max(1, [int][Math]::Ceiling(($x + $w) * $this.GlowWide / $wide) - $gx)
+            [int] $gy = [int][Math]::Floor($y * $this.GlowTall / $tall); [int] $gh = [Math]::Max(1, [int][Math]::Ceiling(($y + $h) * $this.GlowTall / $tall) - $gy)
+            [void]$this.StretchDIBits.Invoke($this.Device, $x, $y, $w, $h, $gx, $this.GlowTall - $gy - $gh, $gw, $gh,
+                $this.GlowPin.AddrOfPinnedObject(), $this.GlowHeader, [uint32]0, [uint32]0x00CC0020)
         }
+    }
+
+    [void] Close() {
+        # DestroyWindow works only on the window's own thread: ask it to close, then let the pump end.
+        if ($this.Handle -ne [IntPtr]::Zero -and $this.IsWindow.Invoke($this.Handle) -ne 0) {
+            [void]$this.PostMessageW.Invoke($this.Handle, [uint32]0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+        }
+        if ($null -ne $this.Pump -and -not $this.Pump.Join(5000)) { throw 'The PSNES window thread did not end.' }
+        $this.Handle = [IntPtr]::Zero; $this.Device = [IntPtr]::Zero
+        if ($this.ClassName -ne [IntPtr]::Zero) { [void]$this.UnregisterClassW.Invoke($this.ClassName, $this.Module) }
         foreach ($pin in $this.Pins) { if ($pin.IsAllocated) { $pin.Free() } }
-        foreach ($block in $this.Header, $this.Message, $this.Rect) { if ($block -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($block) } }
-        $this.Header = [IntPtr]::Zero; $this.Message = [IntPtr]::Zero; $this.Rect = [IntPtr]::Zero
+        if ($this.GlowPin.IsAllocated) { $this.GlowPin.Free() }
+        foreach ($block in $this.ClassName, $this.Title, $this.Published, $this.Message, $this.Rect, $this.Header, $this.GlowHeader) {
+            if ($block -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($block) }
+        }
+        $this.ClassName = $this.Title = $this.Published = $this.Message = $this.Rect = $this.Header = $this.GlowHeader = [IntPtr]::Zero
     }
 }
 
 # Plays an iNES image in a window until the window is closed.
-function Invoke-PSNES([string] $Path) {
+function Invoke-PSNES([string] $Path, [string] $Scaling) {
     $nes = [Nes]::new()
     if (-not $nes.Rom.Load($Path)) { throw "PSNES could not load $Path." }
     $nes.PowerOn()
-    $window = [NesWindow]::new('PSNES - ' + [IO.Path]::GetFileName($Path), 816, 776)
+    $window = [NesWindow]::new('PSNES - ' + [IO.Path]::GetFileName($Path), 816, 776, $Scaling)
     $clock = [Diagnostics.Stopwatch]::StartNew()
     try {
-        while ($window.Pump()) {
-            $nes.Memory.SetControllerState($window.Buttons(), 0)
+        while ($window.Alive()) {
+            $nes.Memory.SetControllerState($window.ReadControls(), 0)
             $nes.RunFrame()
             $window.Present($nes.Ppu.Pixels)
         }
     } finally { $window.Close() }
     [pscustomobject]@{
         Rom = $Path
+        Scaling = $window.Scaling
         Frames = $window.Frames
         Seconds = [Math]::Round($clock.Elapsed.TotalSeconds, 1)
         FramesPerSecond = [Math]::Round($window.Frames / [Math]::Max(0.001, $clock.Elapsed.TotalSeconds), 2)
         Drawn = $window.Drawn
         Skipped = $window.Skipped
         Healed = $window.Healed
-        Repaints = $window.Repaints
     }
 }
 
@@ -2972,5 +3171,5 @@ if ($MyInvocation.InvocationName -ne '.') {
     }
 
     if (-not $Rom) { throw 'Pass -Rom with the path of an iNES image to play, or -Conformance to run the conformance suite.' }
-    Invoke-PSNES -Path $Rom
+    Invoke-PSNES -Path $Rom -Scaling $Scaling
 }
