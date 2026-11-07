@@ -16,7 +16,14 @@
 ## 1. Core accuracy
 
 1. **Mappers.** The largest gap: without them most of the library does not run.
-   - MMC1 (Zelda, Metroid), UxROM (Mega Man, Castlevania), CNROM, AxROM, MMC3 (SMB3, with its scanline IRQ).
+   - Prerequisite: mapper-aware CPU and PPU buses. Today `Memory.Read` maps `$8000-$FFFF` straight into
+     `Rom.PrgRom`, `Memory.Write` never reaches the cartridge, `Ppu.ReadVram` reads `Rom.ChrRom` directly and
+     `RenderFrame` reads the CHR array itself. Both buses must route through the mapper: PRG/CHR banking, cartridge
+     RAM, nametable mirroring and mapper timing.
+   - Order: mapper-aware buses -> PPU fetches timed as the CPU runs -> MMC3's IRQ (clocked by PPU address line A12,
+     not a scanline count) -> broad compatibility.
+   - MMC1 (Zelda, Metroid), UxROM (Mega Man, Castlevania), CNROM, AxROM, MMC3 (SMB3).
+   - NES 2.0 headers and submappers; configurable PRG/CHR RAM and battery NVRAM; board-specific bus conflicts.
    - Each mapper is a class with typed state, so save states and lowering cover it like the rest of the core.
 2. **PPU rendered as the CPU runs** (by dot or by scanline). `RenderFrame` draws after the CPU's frame, and the
    sprite-0 scanline record, per-row scroll capture and `LineY` reuse all exist to work around that. A renderer
