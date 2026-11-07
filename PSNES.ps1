@@ -2612,7 +2612,7 @@ class NesBlit {
             for ([int] $pass = 0; $pass -lt 2; $pass++) { [NesBlit]::Box($plane, $scratch, $wide, $tall, 2) }
         }
         for ([int] $i = 0; $i -lt $count; $i++) {
-            $glow[$i] = [int](0xFF000000 -bor ((($red[$i] * 3) / 5) -shl 16) -bor ((($green[$i] * 3) / 5) -shl 8) -bor (($blue[$i] * 3) / 5))
+            $glow[$i] = [int](0xFF000000 -bor ([int](($red[$i] * 3) / 5) -shl 16) -bor ([int](($green[$i] * 3) / 5) -shl 8) -bor [int](($blue[$i] * 3) / 5))
         }
     }
 
