@@ -115,6 +115,12 @@ class Ppu {
     [byte] $FineX
     [bool] $WriteToggle
     [byte] $DataBuffer
+    # Scanline on which sprite 0 overlaps opaque background this frame, or -1.
+    [int] $Sprite0Line = -1
+    # Scroll and control in force on each visible row, captured as the CPU runs.
+    [int[]] $LineX = [int[]]::new(240)
+    [int[]] $LineY = [int[]]::new(240)
+    [int[]] $LineCtrl = [int[]]::new(240)
 
     Ppu([Rom] $rom) {
         # The PPU is constructed before the ROM is loaded, so allocate the
@@ -261,8 +267,9 @@ class Ppu {
     [Cpu6502] $Cpu
 
     [void] RenderFrame() {
-        # Sprite-0 hit is a frame-local latch in this batched renderer.
-        $this.Status = $this.Status -band 0xBF
+        # RenderFrame runs after the CPU's frame, so it cannot set the sprite-0 flag itself:
+        # it records the hit's scanline, and AdvanceDots sets the flag when the CPU reaches it.
+        $this.Sprite0Line = -1
         # Cache hot PPU fields locally. PowerShell property dispatch inside
         # the 61,440-pixel loop is substantially more expensive than array access.
         [int] $cachedmask = $this.Mask
@@ -289,6 +296,13 @@ class Ppu {
         [int] $vramLength = $cachedvram.Length
 
         for ([int] $y = 0; $y -lt 240; $y++) {
+            # Mid-frame scroll: each row renders with the scroll and control in force on that row.
+            # Row-local: sprites below still use the frame's own Ctrl.
+            $cachedscrollX = $this.LineX[$y]
+            $cachedscrollY = $this.LineY[$y]
+            [int] $rowCtrl = $this.LineCtrl[$y]
+            $baseNt = $rowCtrl -band 0x03
+            $bgPattern = (($rowCtrl -band 0x10) -ne 0) ? 0x1000 : 0
             [int] $worldY = $y + $cachedscrollY
             [int] $ntY = ($worldY -shr 8) -band 1
             [int] $localY = $worldY -band 0xFF
@@ -328,7 +342,8 @@ class Ppu {
                     [int] $sourceCol = $x - $destStart
                     [int] $bit = 7 - $sourceCol
                     [int] $pixel = (($lo -shr $bit) -band 1) -bor ((($hi -shr $bit) -band 1) -shl 1)
-                    [int] $color = $cachedpalette[($paletteNo * 4) + $pixel]
+                    # A transparent background pixel shows the backdrop at $3F00, not its palette's own entry zero.
+                    [int] $color = $cachedpalette[($pixel -eq 0) ? 0 : (($paletteNo * 4) + $pixel)]
                     [int] $frameIndex = ($y * 256) + $x
                     $cachedbgOpaque[$frameIndex] = $bgEnabled -and $pixel -ne 0 -and ($x -ge 8 -or ($cachedmask -band 0x02) -ne 0)
                     if (-not $bgEnabled -or ($x -lt 8 -and ($cachedmask -band 0x02) -eq 0)) {
@@ -373,7 +388,7 @@ class Ppu {
                         if ($n -eq 0 -and $pixelBgOpaque -and $dx -lt 255 -and
                             ($dx -ge 8 -or (($cachedmask -band 0x04) -ne 0)) -and
                             ($dx -ge 8 -or (($cachedmask -band 0x02) -ne 0))) {
-                            $this.Status = $this.Status -bor 0x40
+                            if ($this.Sprite0Line -lt 0 -or $dy -lt $this.Sprite0Line) { $this.Sprite0Line = $dy }
                         }
                         if (($attr -band 0x20) -ne 0 -and $pixelBgOpaque) { continue }
                         $cachedpixels[$idx] = [byte]$cachedpalette[0x10 + (($attr -band 3) * 4) + $pixel]
@@ -393,17 +408,26 @@ class Ppu {
             if ($this.Cycle -ge 341) {
                 $this.Cycle = 0
                 $this.Scanline++
-                
+                if ($this.Scanline -le 240) {
+                    [int] $row = $this.Scanline - 1
+                    [int] $t = $this.TempAddr
+                    $this.LineX[$row] = (($t -band 0x1F) * 8) + $this.FineX
+                    $this.LineY[$row] = if ($row -eq 0) { ((($t -shr 5) -band 0x1F) * 8) + (($t -shr 12) -band 7) } else { $this.LineY[0] }
+                    $this.LineCtrl[$row] = ([int]$this.Ctrl -band 0xFC) -bor (($t -shr 10) -band 3)
+                }
+                if ($this.Scanline -eq $this.Sprite0Line) { $this.Status = $this.Status -bor 0x40 }
+
                 if ($this.Scanline -eq 241) {
                     $this.Status = $this.Status -bor 0x80 # Set VBLANK
                     if (($this.Ctrl -band 0x80) -ne 0) {
-                        if ($this.Cpu -ne $null) {
+                        if ($null -ne $this.Cpu) {
                             $this.Cpu.nmiRaised = $true
                         }
                     }
                 } elseif ($this.Scanline -ge 262) {
                     $this.Scanline = 0
-                    $this.Status = $this.Status -band 0x7F # Clear VBLANK
+                    $this.Status = $this.Status -band 0x3F # Clear VBLANK and sprite-0
+                    $this.Sprite0Line = -1
                     $this.FrameEnded = $true
                 }
             }
@@ -499,7 +523,7 @@ class Memory {
                 $this.ControllerStrobe = $newStrobe
             } elseif ($address -eq 0x4014) {
                 # OAM DMA
-                [ushort] $page = [ushort]($value -shl 8)
+                [ushort] $page = [ushort]([int]$value -shl 8)
                 for ([int] $i = 0; $i -lt 256; $i++) {
                     $this.Ppu.Oam[$this.Ppu.OamAddr] = $this.Read([ushort]($page + $i))
                     $this.Ppu.OamAddr = [byte](($this.Ppu.OamAddr + 1) -band 0xFF)
@@ -950,7 +974,7 @@ class Cpu6502 {
 
     
     [int] Emulate() {
-        if ($this.Mem -eq $null) { return 32 }
+        if ($null -eq $this.Mem) { return 32 }
         
         $this.instrBusCycles = 0
         $this.apuCatchupCycles = 0
@@ -990,8 +1014,8 @@ class Cpu6502 {
         [byte] $opcode = $this.Load([ushort](($this.REG_PC + 1) -band 0xFFFF))
         
         [OpInfo] $opinfo = $this.OpTable[$opcode]
-        if ($opinfo -eq $null) {
-            throw "Game crashed, invalid opcode at address 0x$($this.REG_PC.ToString('X4'))"
+        if ($null -eq $opinfo) {
+            throw ('Game crashed, invalid opcode at address 0x' + $this.REG_PC.ToString('X4'))
         }
         
         [int] $cycleAdd = 0
@@ -1112,7 +1136,7 @@ class Cpu6502 {
         $this.Load($zpPtr10) # dummy read: 6502 reads from ptr before adding X
         [int] $zpAddr10 = ($zpPtr10 + $this.REG_X) -band 0xff
         $addr =
-          $this.Load($zpAddr10) -bor ($this.Load(($zpAddr10 + 1) -band 0xff) -shl 8)
+          [int]$this.Load($zpAddr10) -bor ([int]$this.Load(($zpAddr10 + 1) -band 0xff) -shl 8)
         break
       }
       ([AddrMode]::ADDR_POSTIDXIND) {
@@ -1120,7 +1144,7 @@ class Cpu6502 {
         # zero page, then $add Y. Page-crossing dummy read as in case 8.
         [int] $zpAddr = $this.Load($opaddr + 2)
         $addr =
-          $this.Load($zpAddr) -bor ($this.Load(($zpAddr + 1) -band 0xff) -shl 8)
+          [int]$this.Load($zpAddr) -bor ([int]$this.Load(($zpAddr + 1) -band 0xff) -shl 8)
         $baseHigh = ($addr -shr 8) -band 0xff
         if (($addr -band 0xff00) -ne (($addr + $this.REG_Y) -band 0xff00)) {
           $this.Load(($addr -band 0xff00) -bor (($addr + $this.REG_Y) -band 0xff))
@@ -1136,12 +1160,13 @@ class Cpu6502 {
         # same page instead of crossing to the next page.
         $addr = $this.Load16Bit($opaddr + 2) # Find op
         [int] $hiAddr = ($addr -band 0xff00) -bor ((($addr -band 0xff) + 1) -band 0xff)
-        $addr = $this.Load($addr) -bor ($this.Load($hiAddr) -shl 8)
+        $addr = [int]$this.Load($addr) -bor ([int]$this.Load($hiAddr) -shl 8)
         break
       }
-    
+
         }
-        
+        # Effective addresses wrap at 16 bits, as JSNES (addr &= 0xffff) and FCEUX do.
+        $addr = $addr -band 0xFFFF
         switch ($opinfo.Ins) {
 
       ([Instruction]::INS_ADC) {
@@ -1723,7 +1748,7 @@ class Cpu6502 {
         $this.SetStatusFromStack($this.Pull())
 
         $this.REG_PC = $this.Pull()
-        $this.REG_PC += $this.Pull() -shl 8
+        $this.REG_PC += [int]$this.Pull() -shl 8
         if ($this.REG_PC -eq 0xffff) {
           return $cycleCount
         }
@@ -1738,7 +1763,7 @@ class Cpu6502 {
         # Return from subroutine. Pull PC from stack.
 
         $this.REG_PC = $this.Pull()
-        $this.REG_PC += $this.Pull() -shl 8
+        $this.REG_PC += [int]$this.Pull() -shl 8
 
         if ($this.REG_PC -eq 0xffff) {
           return $cycleCount # return from NSF play routine:
@@ -2177,9 +2202,7 @@ class Cpu6502 {
         [int] $dmaDuringInstr =
           $this._dmcFetchCycles -gt 0 -and
           $this._dmcFetchCycles -le $this.instrBusCycles
-        [int] $shaVal = $dmaDuringInstr
-          ? $this.REG_ACC -band $this.REG_X
-          : $this.REG_ACC -band $this.REG_X -band ((($baseHigh + 1) -band 0xff) -bor 0)
+        [int] $shaVal = $dmaDuringInstr ? ($this.REG_ACC -band $this.REG_X) : ($this.REG_ACC -band $this.REG_X -band ((($baseHigh + 1) -band 0xff) -bor 0))
         if ($cycleAdd -eq 1) {
           $addr = ($shaVal -shl 8) -bor ($addr -band 0xff)
         }
@@ -2201,9 +2224,7 @@ class Cpu6502 {
           $this._dmcFetchCycles -gt 0 -and
           $this._dmcFetchCycles -le $this.instrBusCycles
         $this.REG_SP = ($this.REG_ACC -band $this.REG_X)
-        [int] $shsVal = $dmaDuringInstr2
-          ? $this.REG_SP -band 0xff
-          : $this.REG_SP -band 0xff -band (($baseHigh + 1) -band 0xff)
+        [int] $shsVal = $dmaDuringInstr2 ? ($this.REG_SP -band 0xff) : ($this.REG_SP -band 0xff -band (($baseHigh + 1) -band 0xff))
         if ($cycleAdd -eq 1) {
           $addr = ($shsVal -shl 8) -bor ($addr -band 0xff)
         }
@@ -2224,9 +2245,7 @@ class Cpu6502 {
         [int] $dmaDuringInstr3 =
           $this._dmcFetchCycles -gt 0 -and
           $this._dmcFetchCycles -le $this.instrBusCycles
-        [int] $shyVal = $dmaDuringInstr3
-          ? $this.REG_Y
-          : $this.REG_Y -band (($baseHigh + 1) -band 0xff)
+        [int] $shyVal = $dmaDuringInstr3 ? ($this.REG_Y) : ($this.REG_Y -band (($baseHigh + 1) -band 0xff))
         if ($cycleAdd -eq 1) {
           $addr = ($shyVal -shl 8) -bor ($addr -band 0xff)
         }
@@ -2247,9 +2266,7 @@ class Cpu6502 {
         [int] $dmaDuringInstr4 =
           $this._dmcFetchCycles -gt 0 -and
           $this._dmcFetchCycles -le $this.instrBusCycles
-        [int] $shxVal = $dmaDuringInstr4
-          ? $this.REG_X
-          : $this.REG_X -band (($baseHigh + 1) -band 0xff)
+        [int] $shxVal = $dmaDuringInstr4 ? ($this.REG_X) : ($this.REG_X -band (($baseHigh + 1) -band 0xff))
         if ($cycleAdd -eq 1) {
           $addr = ($shxVal -shl 8) -bor ($addr -band 0xff)
         }
@@ -2299,12 +2316,12 @@ class Cpu6502 {
         break
       }
 
-      default: {
+      default {
         # *******
         # * ??? *
         # *******
 
-        throw "Game crashed, invalid opcode at address 0x$($opaddr.ToString('X4'))"
+        throw ('Game crashed, invalid opcode at address 0x' + $opaddr.ToString('X4'))
       }
     
         }
@@ -2410,7 +2427,7 @@ class Cpu6502 {
     }
 
     [void] DoNonMaskableInterrupt([int] $status) {
-        if ($this.Mem -eq $null) { return }
+        if ($null -eq $this.Mem) { return }
         $this.instrBusCycles++
         $this.Ppu.AdvanceDots(3)
         $this.instrBusCycles++
@@ -2623,6 +2640,11 @@ Case 'sprite zero hit is visible through PPUSTATUS' {
     $r.Ppu.WriteVram(0x2000,0); $r.Ppu.Palette[1]=1; $r.Ppu.Palette[0x11]=2
     $r.Ppu.Oam[0]=0; $r.Ppu.Oam[1]=0; $r.Ppu.Oam[2]=0; $r.Ppu.Oam[3]=8
     $r.Ppu.RenderFrame()
+    # RenderFrame records the hit's scanline; the flag rises when the PPU reaches it.
+    Assert-Equal 1 $r.Ppu.Sprite0Line 'sprite zero hit scanline'
+    Assert-Equal 0 ($r.Ppu.Status -band 0x40) 'sprite zero hit before its scanline'
+    $r.Ppu.Scanline=0; $r.Ppu.Cycle=0
+    $r.Ppu.AdvanceDots(341)
     Assert-Equal 0x40 ($r.Ppu.ReadRegister(0x2002) -band 0x40) 'sprite zero hit'
 }
 # Sprite overflow/evaluation is intentionally unsupported. It remains documented
