@@ -118,7 +118,7 @@
 - Data-oriented core: each machine's state in flat typed arrays indexed by instance; one lowered loop steps N
   machines. Faster on the CPU, trivial snapshots, batch training across all CPU threads.
 - GPU: thousands of machines in lockstep, one thread each; the PPU per pixel. Needs a GPU backend in PSC (DXIL or
-  SPIR-V). Divergence between machines is the cost to measure. MarI/O-scale training is the reason.
+  SPIR-V). Divergence between machines is the cost to measure. MarI/O-scale semantic discovery experiments are the reason (section 12).
 
 ## 11. Build
 
@@ -126,6 +126,104 @@
   preview.6. Pinning matching rc.3 packages needs a download.
 - The native image still links `ucrt.lib`.
 - ELF output for Linux and Android, from the Pwsh project's `New-ElfCodeLibrary` and kokoro-hexagon's linker work.
+
+## 12. Developmental semantic discovery and alternate realizations
+
+### Objective
+
+PSNES is an emulator in its own right and a developmental environment for Student. Its distinguishing objective is to discover the semantics of a game from execution and to realize those semantics in forms other than the original framebuffer. Compete with the authored-profile approach of 3dSen by acquiring reusable knowledge from evidence rather than requiring someone to hand-author every game's geometry and behavior.
+
+The first flagship is Super Mario Bros. (NES): a complete, continuous start-to-finish adventure, including an uninterrupted traversal of the original world's successive areas, and an optional genuinely navigable 3D realization with Mario 64-style movement and camera behavior. These are alternate experiences, not claims that the original NES simulation contains a hidden three-dimensional world.
+
+Keep the original emulator, discovered semantics and alternate realizations independently testable. Faithful emulation remains available regardless of how much Student learns or how an alternate world is realized. The following milestones are planned, not completed features.
+
+### 12.1. Emulator as an experimental substrate
+
+- Establish frame-exact observations and reproducible snapshots of CPU state, RAM, cartridge state, PPU memory, OAM, palette, scroll, controller state and, when available, APU events. Distinguish a hardware observation from an interpretation.
+- Import BizHawk input movies (initially supported BK2 profiles); validate ROM identity, initial state, controller mapping, reset events and timing before accepting a replay as evidence. Do not assume BizHawk save states are portable. Reconstruct checkpoints by replaying from an admitted initial state or use a separately validated state translation.
+- Replay headlessly, fork from retained checkpoints and execute independent trials. Preserve the player's live machine from experimental changes. Retain input histories and reproducibility witnesses; allow a discovery to be independently challenged.
+- Use triple-buffered presentation as an independent consumer of completed frame epochs; observation and replay collection must not depend on displayed frames, skipped presentation frames or rendering speed. Validate buffer ownership and publication rather than using throughput alone as evidence of smooth gameplay.
+- Reuse the existing emulator core in interactive, headless and batch modes. Establish CPU-parallel trials and measure scaling before introducing a GPU backend.
+
+### 12.2. Evolve the discoverer, not a game-playing agent
+
+The owner's earlier Mario.lua/MarI/O experiments used NEAT, multi-objective fitness, multiple savestates, enriched sensory inputs and retained replays. The new purpose is not to evolve a better Mario controller. Evolve Student's ability to discover, compose, test and revise semantic relationships from replays. Controller policies and human/TAS movies are sources of developmental experience; game progress is not the principal fitness objective.
+
+Reuse PSC's DiscoveryMechanisms and Student's existing typed observation, referent and retention mechanisms. Do not create a second unrelated semantic framework in the emulator. Retain evolutionary search, replay visualization and experimental scheduling ideas from Mario.lua; do not inherit its game-specific RAM addresses as the required perceptual interface. Known addresses may serve as withheld verification or explicitly identified seeds.
+
+- **Within a developmental lifetime:** acquire observations, propose relationships, test predictions, compose discoveries, retain evidence and withdraw contradicted relationships.
+- **Across generations:** vary discovery operators, attention, temporal association, candidate relationship composition, experiment selection, retention and revision policies. Select for the quality and efficiency of discoveries, not the fitness of a game-playing network.
+- **Evaluation:** use held-out trajectories, unseen areas, altered starting states and ultimately unfamiliar games. Score predictive consistency, invariance, evidence coverage, useful abstraction, acquisition cost and transfer; penalize unsupported assertions, overfitting, gratuitous complexity and failure to revise. Record a vector of results before choosing any scalar selection policy.
+- **Controls:** separate training observations from independent verification, compare against a fixed non-evolved discoverer, and test evolved discovery policies with fresh knowledge stores. Distinguish inherited discovery capability from previously acquired game knowledge.
+- **Interventions:** branch a replay where observational evidence is ambiguous, vary a controller action or an admitted experimental state, and test competing explanations. Mark interventions separately from ordinary game observations.
+
+A successful Student should recover relationships such as world-relative position and velocity, camera transformation, sprite grouping, animation, collision, enemy activation, collectible interactions, doors/pipes, transitions and decorative layers. Unknown or underdetermined semantics remain unknown. A two-dimensional trace cannot uniquely establish three-dimensional geometry.
+
+### 12.3. Scripting and inspection as a first-class emulator capability
+
+Extend section 7 by porting the reusable PowerShell child-session and terminal interaction from Notepad, rather than embedding a separate Lua interpreter. Inspect the actual Notepad implementation at integration time; distinguish a working terminal from an emulator object interface.
+
+Expose the emulator's own typed objects and operations through the same admitted application boundary in interactive and automated modes: observation, frame stepping, controller input, checkpoints, replay, independent instances, semantic inquiries, experimental branches and visualization. Hosted scripts may hold live typed objects; the native player must expose explicit synchronized state and control capabilities rather than assuming child-process object identity.
+
+Use the existing proposed COM/NT shared-state design where it remains appropriate; reuse PSC facilities for identity, acquisition and lifetime as they mature. A console is an interaction surface, not the transport for large machine-state or frame payloads. Do not block the emulation or presentation thread on a script. Make the semantic viewer, experiments and replay controls accessible from the same interface users can script.
+
+The emulator's native discovery integration must not require that a script console be open. Eventually the same interface should admit PSC's independent reflective runspace; this is not a dependency for the first release.
+
+### 12.4. Persistent world knowledge and widescreen
+
+Extend the per-ROM `.psnes` artifact with typed retained semantic knowledge, source/replay identity, provenance, world coordinates, relationships and confidence/refusal evidence, separate from player save states and preferences. Version discoveries and realizations; invalidate or revalidate them when the ROM or relevant observation profile changes.
+
+- Stitch observed terrain and map area-relative coordinates into a persistent world. Associate entities with semantic identities rather than recycled OAM slots.
+- Learn spawn origins, activation windows, despawn/reappearance behavior, trajectories and interaction constraints from replays and experiments.
+- Realize known entities outside the original 256-pixel viewport before the game instantiates their sprites. Continue presentation-only entities when the original game drops them. Reconcile with authoritative game state on activation, avoiding duplicate entities, abrupt position corrections and visible pop-in where evidence permits.
+- Evaluate offscreen position and activation predictions on held-out replays, including reversals, deaths and alternate routes. Do not silently inject simulated actors into the original machine. Where knowledge is insufficient, retain uncertainty or fall back to faithful presentation.
+- Generate background scenery, parallax, lighting and atmospheric effects from discovered spatial and decorative roles, using NES assets as seeds. Keep observed geometry distinct from generated extensions. The existing presentation-only restriction in section 9 applies to faithful/enhanced emulation; alternate gameplay is a separately selected realization.
+
+### 12.5. Alternate world realization
+
+Treat the semantic world as independently representable, analogous to the separation of semantics and realization elsewhere in PSC. The same learned game can have several explicit realizations:
+
+| Mode | Authority | Intended experience |
+| --- | --- | --- |
+| Original | NES machine | Faithful framebuffer and controls |
+| Extended 2D | NES machine | Persistent terrain, wide view, coherent offscreen presentation |
+| 3D presentation | NES machine | Depth, geometry, parallax and camera freedom without altering game rules |
+| Alternate 3D gameplay | Alternate world simulation | Free spatial movement, 3D collision, camera and interaction inspired by the original game |
+| Continuous adventure | Selected realization | Seamlessly connected areas and transitions across a complete game |
+
+The alternate 3D mode is not restricted to extruding the original playfield or retaining the original two-dimensional movement model. Support analog movement in a genuine three-dimensional world, a chase camera, jumping, geometry-aware collisions and spatially realized enemies, collectibles and transitions. Preserve the discovered identity and meaningful relationships of the original assets while explicitly defining newly introduced depth, physics and controls. The alternate simulation owns these new gameplay semantics; no claim of exact NES behavioral equivalence is made.
+
+Use procedural 3D realizations of NES assets: tiles, sprites, palette and animation evidence become inputs to typed geometry and material primitives. Geometry may be extruded, composed, generated or realized as billboards as appropriate to the discovered role. Reuse the owner's Windows graphics primitives and OS-provided acceleration where they express the desired operation. Do not make direct GPU programming or a new shader compiler a prerequisite; measure limitations first. A world and its assets must not be defined in terms of a particular rendering backend.
+
+Support loading alternate world/asset realizations against retained semantic referents. Permit replacement of the representation without replacing the underlying knowledge. Keep game-specific hand-authored additions optional and distinguish them from discovered relationships and generated content.
+
+### 12.6. Flagship: Super Mario Bros. as one continuous adventure
+
+The intended experience is a playable journey from the beginning of World 1-1 through the final castle of World 8-4, without visible loading screens or mandatory between-area interstitials. Use the original game's assets and discovered semantics, not a collection of unrelated generated levels.
+
+- Acquire the full area and transition graph from valid replays and experimental branches: overworlds, underground and underwater areas, castles, pipe connections, warp destinations and end-of-level progression.
+- Preserve meaningful connections and progression conditions. Distinguish the normal sequential route from optional warp routes; verify the full sequential playthrough, including all 32 main stages, rather than using warps to bypass coverage.
+- Compose connected spatial areas with continuous transitions; prepare upcoming assets, geometry and entities before crossing a boundary. A pipe, doorway, flagpole, castle exit or other discovered transition may become a traversable connection or short in-world transition instead of a loading screen.
+- Carry player progression and relevant persistent state across boundaries under the chosen realization. Where the original uses resets, timers or distinct local coordinate spaces, preserve their meaning in faithful mode and explicitly define the alternate-mode mapping. Do not require all areas to reside in memory at once.
+- In faithful/enhanced mode, preserve original machine transitions and timing even when presentation conceals them; seamless continuous control and reauthored traversal belong to the alternate simulation when the ROM cannot supply them.
+- First prove continuity between two adjacent areas including a return or branch; expand to all areas and demonstrate a recorded end-to-end run. Measure transition stalls, frame pacing, missing geometry, entity pop-in and progression consistency. The final demonstration is continuous *play*, not a prerecorded cinematic.
+
+### 12.7. Milestones and acceptance
+
+| Milestone | Exit evidence |
+| --- | --- |
+| E0: trustworthy core | Reproducible state, input and replay witnesses; original emulator regressions preserved; mapper/PPU/APU work tracked under section 1 |
+| E1: scriptable experiments | Notepad-derived terminal plus typed emulator operations, independently forked machine states and synchronized observation; no script-dependent frame pacing |
+| E2: evolved discovery | Fixed-policy baseline versus evolved discoverer on held-out replays; recover meaningful relationships without mandatory Mario-specific address annotations |
+| E3: persistent world | Terrain and entity identity survive scrolling and slot reuse; measured reduction of widescreen pop-in without corrupting authoritative execution |
+| E4: procedural 3D | Load a new realization of the same semantic world; 3D presentation and procedural scenery using the existing graphics primitives |
+| E5: alternate gameplay | Mario 64-style movement, camera, 3D collision and interactions in a world realized from NES assets; explicitly separate alternate simulation |
+| E6: uninterrupted adventure | Complete non-warp Super Mario Bros. run, coherent transitions, no visible loading screens, reproducible progression and measured presentation continuity |
+| E7: transfer | Apply the discoverer and realization machinery to a second game; report what transferred, what was newly acquired and what required explicit authoring |
+
+These are dependency-informed milestones, not a requirement to complete every mapper or unrelated emulator feature before prototyping. Preserve the existing fidelity and build acceptance evidence. Keep performance claims tied to their actual profile; the historical headless benchmark does not establish the cost of Student, full APU/PPU accuracy or 3D rendering.
+
+Distribute PSNES and its own code independently of commercial ROMs. User-supplied authorized ROMs provide the source assets; verify rights before publishing ROM-derived asset packs or replay artifacts containing protected material.
 
 ## Capabilities PSNES needs from PSC
 
