@@ -11,7 +11,8 @@
 - The lowered core references only `System.Private.CoreLib` and `System.Console`.
 - nestest: the lowered and interpreted cores give identical traces over 9,087 instructions, matching JSNES and
   FCEUX through instruction 8,991.
-- Only mapper 0 (NROM) cartridges run. There is no APU: writes to `$4000`-`$4017` are dropped.
+- Mappers 0 (NROM), 1 (MMC1), 2 (UxROM), 3 (CNROM) and 7 (AxROM) are implemented through mapper-aware CPU/PPU buses (`Mapper` hierarchy), verified by synthetic conformance tests; broad commercial cartridge compatibility and MMC3 (mapper 4) remain open. There is no APU: writes to `$4000`-`$4017` are dropped.
+- Post-mapper PSC lowering (`PsnesBench.dll`, 43,008 bytes) compiles cleanly and matches interpreted RAM checksums (`D800000000000003` at 60 frames; 3,600 frames in 3,939 ms lowered).
 
 ## 1. Core accuracy
 

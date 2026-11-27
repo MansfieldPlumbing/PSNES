@@ -19,7 +19,7 @@ The [roadmap](ROADMAP.md#where-it-stands) records the prior PSC-managed and Nati
 
 `PsnesBench.Main(string[])` takes a ROM path and frame count and reports elapsed time and a RAM checksum. It is a distinct entry point, not a switch on the interactive application.
 
-Mapper 0 (NROM) is the supported cartridge boundary. NES 2.0 and other mappers are rejected. APU emulation and general cartridge compatibility remain open.
+Mapper-aware CPU and PPU buses are implemented for mappers 0 (NROM), 1 (MMC1), 2 (UxROM), 3 (CNROM) and 7 (AxROM). NES 2.0 and other mappers are rejected. Commercial cartridge compatibility across all board variants, APU emulation and cycle-accurate mid-frame PPU rendering remain open.
 
 ## Upstream PSC integration
 
