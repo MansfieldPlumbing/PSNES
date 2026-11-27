@@ -34,6 +34,7 @@ class Mapper {
     [void] PpuWrite([ushort] $address, [byte] $value) { }
     [Mirroring] GetMirroring() { return $this.Rom.Mirroring }
     [void] ClockIrq() { }
+    [void] ObservePpuAddress([ushort] $address) { }
     [bool] IsIrqPending() { return $false }
 }
 
@@ -279,6 +280,8 @@ class Mapper4 : Mapper {
     [bool] $IrqReload = $false
     [bool] $IrqEnabled = $false
     [bool] $IrqPending = $false
+    [bool] $LastA12 = $false
+    [int] $A12LowDots = 0
 
     Mapper4([Rom] $rom) : base($rom) {
         $this.MirrorMode = $rom.Mirroring
@@ -392,6 +395,19 @@ class Mapper4 : Mapper {
 
     [bool] IsIrqPending() {
         return $this.IrqPending
+    }
+
+    [void] ObservePpuAddress([ushort] $address) {
+        [bool] $a12 = ($address -band 0x1000) -ne 0
+        if ($a12) {
+            if (-not $this.LastA12 -and $this.A12LowDots -ge 9) {
+                $this.ClockIrq()
+            }
+            $this.A12LowDots = 0
+        } else {
+            $this.A12LowDots++
+        }
+        $this.LastA12 = $a12
     }
 
     [void] ClockIrq() {
@@ -731,6 +747,7 @@ class Ppu {
 
     [byte] ReadVram([ushort] $addr) {
         $addr = $addr % 0x4000
+        $this.Rom.EnsureMapper().ObservePpuAddress($addr)
         if ($addr -lt 0x2000) {
             return $this.Rom.EnsureMapper().PpuRead($addr)
         } elseif ($addr -lt 0x3F00) {
@@ -747,6 +764,7 @@ class Ppu {
 
     [void] WriteVram([ushort] $addr, [byte] $val) {
         $addr = $addr % 0x4000
+        $this.Rom.EnsureMapper().ObservePpuAddress($addr)
         if ($addr -lt 0x2000) {
             $this.Rom.EnsureMapper().PpuWrite($addr, $val)
         } elseif ($addr -lt 0x3F00) {
@@ -896,8 +914,14 @@ class Ppu {
     [void] AdvanceDots([int] $dots) {
         for ([int] $i = 0; $i -lt $dots; $i++) {
             $this.Cycle++
-            if ($this.Cycle -eq 260 -and ($this.Mask -band 0x18) -ne 0 -and ($this.Scanline -lt 240 -or $this.Scanline -eq 261)) {
-                $this.Rom.EnsureMapper().ClockIrq()
+            if (($this.Mask -band 0x18) -ne 0 -and ($this.Scanline -lt 240 -or $this.Scanline -eq 261)) {
+                if ($this.Cycle -ge 257 -and $this.Cycle -le 320) {
+                    [ushort] $sprAddr = (($this.Ctrl -band 0x28) -ne 0) ? [ushort]0x1000 : [ushort]0x0000
+                    $this.Rom.EnsureMapper().ObservePpuAddress($sprAddr)
+                } elseif (($this.Cycle -ge 1 -and $this.Cycle -le 256) -or ($this.Cycle -ge 321 -and $this.Cycle -le 336)) {
+                    [ushort] $bgAddr = (($this.Ctrl -band 0x10) -ne 0) ? [ushort]0x1000 : [ushort]0x0000
+                    $this.Rom.EnsureMapper().ObservePpuAddress($bgAddr)
+                }
             }
             if ($this.Cycle -ge 341) {
                 $this.Cycle = 0
