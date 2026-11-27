@@ -666,6 +666,9 @@ class Ppu {
     [bool[]] $SprLineOpaque = [bool[]]::new(256)
     [bool[]] $SprLineBehind = [bool[]]::new(256)
     [bool[]] $SprLineIs0 = [bool[]]::new(256)
+    [int[]] $SprLineOamIdx = [int[]]::new(256)
+    [bool] $RecordPixelSource = $false
+    [int[]] $PixelSource = [int[]]::new(61440)
     [int] $BgNextTile = 0
     [int] $BgNextAttr = 0
     [int] $BgNextLo = 0
@@ -864,6 +867,7 @@ class Ppu {
                             $this.SprLineColor[$pxX] = $this.Palette[$palBase + $px]
                             $this.SprLineBehind[$pxX] = $behind
                             $this.SprLineIs0[$pxX] = $isZero
+                            $this.SprLineOamIdx[$pxX] = $i
                         }
                     }
                     $this.SprCount++
@@ -906,14 +910,24 @@ class Ppu {
         }
 
         [byte] $finalColor = $this.Palette[0]
+        [int] $src = 0
         if ($bgSolid -and $sprOpaque) {
-            $finalColor = $sprBehind ? $bgColor : $sprColor
+            if ($sprBehind) {
+                $finalColor = $bgColor
+                $src = 0x10000000 -bor ([int]$bgColor)
+            } else {
+                $finalColor = $sprColor
+                $src = 0x20000000 -bor ($this.SprLineOamIdx[$x] -shl 8) -bor ([int]$sprColor)
+            }
         } elseif ($bgSolid) {
             $finalColor = $bgColor
+            $src = 0x10000000 -bor ([int]$bgColor)
         } elseif ($sprOpaque) {
             $finalColor = $sprColor
+            $src = 0x20000000 -bor ($this.SprLineOamIdx[$x] -shl 8) -bor ([int]$sprColor)
         }
         $this.Pixels[$y * 256 + $x] = $finalColor
+        if ($this.RecordPixelSource) { $this.PixelSource[$y * 256 + $x] = $src }
     }
 
     [void] LoadBgShiftRegisters() {
@@ -3252,6 +3266,7 @@ class Nes {
         $child.Rom.PrgRamSize = $this.Rom.PrgRamSize
         $child.Rom.PrgNvramSize = $this.Rom.PrgNvramSize
         $child.Rom.IsValid = $this.Rom.IsValid
+        $child.Rom.MapperImpl = $null
         $child.PowerOn()
         $child.RestoreSnapshot($snapshot)
         return $child
@@ -3286,6 +3301,10 @@ class Nes {
         [Array]::Copy($this.Ppu.Palette, $obs.Palette, $this.Ppu.Palette.Length)
         $obs.Pixels = [byte[]]::new($this.Ppu.Pixels.Length)
         [Array]::Copy($this.Ppu.Pixels, $obs.Pixels, $this.Ppu.Pixels.Length)
+        if ($this.Ppu.RecordPixelSource) {
+            $obs.PixelSource = [int[]]::new($this.Ppu.PixelSource.Length)
+            [Array]::Copy($this.Ppu.PixelSource, $obs.PixelSource, $this.Ppu.PixelSource.Length)
+        }
         return $obs
     }
 
@@ -3350,10 +3369,43 @@ class Nes {
         $s.BgNextLo = $this.Ppu.BgNextLo
         $s.BgNextHi = $this.Ppu.BgNextHi
         $s.BgPrefetched = $this.Ppu.BgPrefetched
+        $s.MapperId = $this.Rom.Mapper
+        [Mapper] $m = $this.Rom.EnsureMapper()
+        if ($m -is [Mapper1]) {
+            [Mapper1] $m1 = [Mapper1]$m
+            $s.MapperInts = [int[]]@($m1.ShiftReg, $m1.Control, $m1.ChrBank0, $m1.ChrBank1, $m1.PrgBank)
+            $s.MapperLong = $m1.LastWriteCycle
+        } elseif ($m -is [Mapper2]) {
+            $s.MapperInts = [int[]]@(([Mapper2]$m).PrgBank)
+        } elseif ($m -is [Mapper3]) {
+            $s.MapperInts = [int[]]@(([Mapper3]$m).ChrBank)
+        } elseif ($m -is [Mapper4]) {
+            [Mapper4] $m4 = [Mapper4]$m
+            $s.MapperInts = [int[]]::new(15)
+            $s.MapperInts[0] = $m4.BankSelect
+            for ([int] $bi = 0; $bi -lt 8; $bi++) { $s.MapperInts[1 + $bi] = $m4.Regs[$bi] }
+            $s.MapperInts[9] = $m4.IrqLatch
+            $s.MapperInts[10] = $m4.IrqCounter
+            $s.MapperInts[11] = $m4.IrqReload ? 1 : 0
+            $s.MapperInts[12] = $m4.IrqEnabled ? 1 : 0
+            $s.MapperInts[13] = $m4.IrqPending ? 1 : 0
+            $s.MapperInts[14] = [int]$m4.MirrorMode
+            $s.MapperLong = $m4.LastA12LowDot
+            $s.MapperBool = $m4.LastA12
+        } elseif ($m -is [Mapper7]) {
+            [Mapper7] $m7 = [Mapper7]$m
+            $s.MapperInts = [int[]]@($m7.PrgBank, [int]$m7.MirrorMode)
+        } elseif ($m -is [Mapper66]) {
+            [Mapper66] $m66 = [Mapper66]$m
+            $s.MapperInts = [int[]]@($m66.PrgBank, $m66.ChrBank)
+        }
         return $s
     }
 
     [void] RestoreSnapshot([MachineSnapshot] $s) {
+        if ($s.MapperId -ne $this.Rom.Mapper) {
+            throw "Snapshot mapper $($s.MapperId) is incompatible with ROM mapper $($this.Rom.Mapper)."
+        }
         [Array]::Copy($s.Ram, $this.Memory.Ram, $this.Memory.Ram.Length)
         if ($this.Memory.Sram.Length -gt 0 -and $s.Sram.Length -eq $this.Memory.Sram.Length) {
             [Array]::Copy($s.Sram, $this.Memory.Sram, $this.Memory.Sram.Length)
@@ -3393,6 +3445,57 @@ class Nes {
         $this.Cpu._cpuCycleBase = $s.CpuCycleBase
         $this.Cpu.nmiRaised = $s.NmiRaised
         $this.Cpu.nmiPending = $s.NmiPending
+        $this.Memory.Controller1 = $s.Controller1
+        $this.Memory.Controller2 = $s.Controller2
+        $this.Memory.Controller1Index = $s.Controller1Index
+        $this.Memory.Controller2Index = $s.Controller2Index
+        $this.Memory.ControllerStrobe = $s.ControllerStrobe
+        if ($null -ne $s.Pixels -and $s.Pixels.Length -eq $this.Ppu.Pixels.Length) {
+            [Array]::Copy($s.Pixels, $this.Ppu.Pixels, $this.Ppu.Pixels.Length)
+        }
+        $this.Ppu.BgShiftLo = $s.BgShiftLo
+        $this.Ppu.BgShiftHi = $s.BgShiftHi
+        $this.Ppu.BgAttrLo = $s.BgAttrLo
+        $this.Ppu.BgAttrHi = $s.BgAttrHi
+        $this.Ppu.BgNextTile = $s.BgNextTile
+        $this.Ppu.BgNextAttr = $s.BgNextAttr
+        $this.Ppu.BgNextLo = $s.BgNextLo
+        $this.Ppu.BgNextHi = $s.BgNextHi
+        $this.Ppu.BgPrefetched = $s.BgPrefetched
+        [Mapper] $m = $this.Rom.EnsureMapper()
+        if ($m -is [Mapper1] -and $null -ne $s.MapperInts -and $s.MapperInts.Length -ge 5) {
+            [Mapper1] $m1 = [Mapper1]$m
+            $m1.ShiftReg = [byte]$s.MapperInts[0]
+            $m1.Control = [byte]$s.MapperInts[1]
+            $m1.ChrBank0 = [byte]$s.MapperInts[2]
+            $m1.ChrBank1 = [byte]$s.MapperInts[3]
+            $m1.PrgBank = [byte]$s.MapperInts[4]
+            $m1.LastWriteCycle = $s.MapperLong
+        } elseif ($m -is [Mapper2] -and $null -ne $s.MapperInts -and $s.MapperInts.Length -ge 1) {
+            ([Mapper2]$m).PrgBank = $s.MapperInts[0]
+        } elseif ($m -is [Mapper3] -and $null -ne $s.MapperInts -and $s.MapperInts.Length -ge 1) {
+            ([Mapper3]$m).ChrBank = $s.MapperInts[0]
+        } elseif ($m -is [Mapper4] -and $null -ne $s.MapperInts -and $s.MapperInts.Length -ge 15) {
+            [Mapper4] $m4 = [Mapper4]$m
+            $m4.BankSelect = [byte]$s.MapperInts[0]
+            for ([int] $bi = 0; $bi -lt 8; $bi++) { $m4.Regs[$bi] = $s.MapperInts[1 + $bi] }
+            $m4.IrqLatch = [byte]$s.MapperInts[9]
+            $m4.IrqCounter = [byte]$s.MapperInts[10]
+            $m4.IrqReload = ($s.MapperInts[11] -ne 0)
+            $m4.IrqEnabled = ($s.MapperInts[12] -ne 0)
+            $m4.IrqPending = ($s.MapperInts[13] -ne 0)
+            $m4.MirrorMode = [Mirroring]$s.MapperInts[14]
+            $m4.LastA12LowDot = $s.MapperLong
+            $m4.LastA12 = $s.MapperBool
+        } elseif ($m -is [Mapper7] -and $null -ne $s.MapperInts -and $s.MapperInts.Length -ge 2) {
+            [Mapper7] $m7 = [Mapper7]$m
+            $m7.PrgBank = $s.MapperInts[0]
+            $m7.MirrorMode = [Mirroring]$s.MapperInts[1]
+        } elseif ($m -is [Mapper66] -and $null -ne $s.MapperInts -and $s.MapperInts.Length -ge 2) {
+            [Mapper66] $m66 = [Mapper66]$m
+            $m66.PrgBank = $s.MapperInts[0]
+            $m66.ChrBank = $s.MapperInts[1]
+        }
     }
 }
 
@@ -4248,6 +4351,26 @@ Case 'independent Nes.Branch and NesObservation capture' {
     Assert-Equal 2 $obs.FrameIndex 'observation frame index'
     Assert-Equal 2048 $obs.Ram.Length 'observation RAM length'
     Assert-Equal 61440 $obs.Pixels.Length 'observation Pixels length'
+}
+Case 'MMC3 snapshot restore and PixelSource observation' {
+    $n = [Nes]::new()
+    $n.Rom.PrgRom = [byte[]]::new(32768); $n.Rom.ChrRom = [byte[]]::new(8192); $n.Rom.ChrRam = $true; $n.Rom.IsValid = $true
+    $n.Rom.Mapper = 4; $n.Rom.MapperImpl = $null
+    $n.Rom.PrgRom[0] = 0xE6; $n.Rom.PrgRom[1] = 0x00; $n.Rom.PrgRom[2] = 0x4C; $n.Rom.PrgRom[3] = 0x00; $n.Rom.PrgRom[4] = 0x80
+    $n.Rom.PrgRom[0x7FFC] = 0x00; $n.Rom.PrgRom[0x7FFD] = 0x80
+    $n.PowerOn()
+    $m4 = [Mapper4]$n.Rom.EnsureMapper()
+    $m4.IrqLatch = 7; $m4.IrqCounter = 3; $m4.IrqEnabled = $true; $m4.Regs[6] = 2
+    $n.Ppu.RecordPixelSource = $true
+    $n.RunFrame()
+    $snap = $n.CaptureSnapshot()
+    $b1 = $n.Branch($snap)
+    $b1m4 = [Mapper4]$b1.Rom.EnsureMapper()
+    Assert-Equal 7 $b1m4.IrqLatch 'MMC3 IrqLatch restored'
+    Assert-Equal 3 $b1m4.IrqCounter 'MMC3 IrqCounter restored'
+    Assert-Equal 2 $b1m4.Regs[6] 'MMC3 Regs[6] restored'
+    $obs = $n.CaptureObservation(1)
+    Assert-Equal 61440 $obs.PixelSource.Length 'PixelSource populated when enabled'
 }
 $results | Format-Table -AutoSize
 if (@($results | Where-Object Result -eq 'FAIL').Count -gt 0) { exit 1 }
