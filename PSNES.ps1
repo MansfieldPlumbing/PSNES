@@ -661,10 +661,19 @@ class Ppu {
     [int[]] $SprHi = [int[]]::new(8)
     [bool[]] $SprIs0 = [bool[]]::new(8)
     [int] $SprCount = 0
-    [int] $BgTileLo = 0
-    [int] $BgTileHi = 0
-    [int] $BgTilePal = 0
-    [int] $BgCachedTile = -1
+    [byte[]] $SprLineColor = [byte[]]::new(256)
+    [bool[]] $SprLineOpaque = [bool[]]::new(256)
+    [bool[]] $SprLineBehind = [bool[]]::new(256)
+    [bool[]] $SprLineIs0 = [bool[]]::new(256)
+    [int] $BgNextTile = 0
+    [int] $BgNextAttr = 0
+    [int] $BgNextLo = 0
+    [int] $BgNextHi = 0
+    [int] $BgShiftLo = 0
+    [int] $BgShiftHi = 0
+    [int] $BgAttrLo = 0
+    [int] $BgAttrHi = 0
+    [bool] $BgPrefetched = $false
 
     Ppu([Rom] $rom) {
         # The PPU is constructed before the ROM is loaded, so allocate the
@@ -808,7 +817,7 @@ class Ppu {
 
     [void] EvaluateScanlineSprites([int] $y) {
         $this.SprCount = 0
-        $this.BgCachedTile = -1
+        [Array]::Clear($this.SprLineOpaque, 0, 256)
         [int] $sprH = (($this.Ctrl -band 0x20) -ne 0) ? 16 : 8
         [Mapper] $mapper = $this.Rom.EnsureMapper()
         for ([int] $i = 0; $i -lt 64; $i++) {
@@ -817,6 +826,7 @@ class Ppu {
                 if ($this.SprCount -lt 8) {
                     [int] $tile = $this.Oam[$i * 4 + 1]
                     [int] $attr = $this.Oam[$i * 4 + 2]
+                    [int] $sx = $this.Oam[$i * 4 + 3]
                     [int] $row = $y - $sy
                     if (($attr -band 0x80) -ne 0) { $row = ($sprH - 1) - $row }
                     [int] $patBase = 0
@@ -828,13 +838,32 @@ class Ppu {
                         $patBase = (($this.Ctrl -band 0x08) -ne 0) ? 0x1000 : 0
                     }
                     [int] $plane = $patBase + ($tile * 16) + $row
+                    [int] $lo = $mapper.PpuRead([ushort]$plane)
+                    [int] $hi = $mapper.PpuRead([ushort]($plane + 8))
                     $this.SprY[$this.SprCount] = $sy
                     $this.SprTile[$this.SprCount] = $tile
                     $this.SprAttr[$this.SprCount] = $attr
-                    $this.SprX[$this.SprCount] = $this.Oam[$i * 4 + 3]
-                    $this.SprLo[$this.SprCount] = $mapper.PpuRead([ushort]$plane)
-                    $this.SprHi[$this.SprCount] = $mapper.PpuRead([ushort]($plane + 8))
+                    $this.SprX[$this.SprCount] = $sx
+                    $this.SprLo[$this.SprCount] = $lo
+                    $this.SprHi[$this.SprCount] = $hi
                     $this.SprIs0[$this.SprCount] = ($i -eq 0)
+                    [bool] $flipX = ($attr -band 0x40) -ne 0
+                    [int] $palBase = 0x10 + (($attr -band 3) * 4)
+                    [bool] $behind = ($attr -band 0x20) -ne 0
+                    [bool] $isZero = ($i -eq 0)
+                    for ([int] $col = 0; $col -lt 8; $col++) {
+                        [int] $pxX = $sx + $col
+                        if ($pxX -ge 256) { break }
+                        if ($this.SprLineOpaque[$pxX]) { continue }
+                        [int] $bit = $flipX ? $col : (7 - $col)
+                        [int] $px = (($lo -shr $bit) -band 1) -bor ((($hi -shr $bit) -band 1) -shl 1)
+                        if ($px -ne 0) {
+                            $this.SprLineOpaque[$pxX] = $true
+                            $this.SprLineColor[$pxX] = $this.Palette[$palBase + $px]
+                            $this.SprLineBehind[$pxX] = $behind
+                            $this.SprLineIs0[$pxX] = $isZero
+                        }
+                    }
                     $this.SprCount++
                 } else {
                     $this.Status = $this.Status -bor 0x20
@@ -848,36 +877,12 @@ class Ppu {
         [byte] $bgColor = 0
         [bool] $bgSolid = $false
         if (($this.Mask -band 0x08) -ne 0 -and ($x -ge 8 -or ($this.Mask -band 0x02) -ne 0)) {
-            [int] $fineXPos = ($x -band 7) + $this.FineX
-            [int] $tileStep = ($x -shr 3) + ($fineXPos -shr 3)
-            if ($tileStep -ne $this.BgCachedTile) {
-                [Mapper] $mapper = $this.Rom.EnsureMapper()
-                [int] $v = $this.VramAddr
-                [int] $coarseX = ($v -band 0x1F) + ($fineXPos -shr 3)
-                [int] $nt = ($v -shr 10) -band 3
-                if ($coarseX -ge 32) {
-                    $coarseX -= 32
-                    $nt = $nt -bxor 1
-                }
-                [int] $coarseY = ($v -shr 5) -band 0x1F
-                [int] $fineY = ($v -shr 12) -band 7
-                [int] $ntTable = $this.ResolveNametable($nt)
-                [int] $ntBase = ($ntTable * 1024) % $this.Vram.Length
-                [int] $tile = $this.Vram[($ntBase + ($coarseY * 32) + $coarseX) % $this.Vram.Length]
-                [int] $attr = $this.Vram[($ntBase + 0x3C0 + (($coarseY -shr 2) * 8) + ($coarseX -shr 2)) % $this.Vram.Length]
-                [int] $quadrant = ((($coarseY -band 2) -shr 1) -shl 1) -bor (($coarseX -band 2) -shr 1)
-                $this.BgTilePal = ($attr -shr ($quadrant * 2)) -band 3
-                [int] $bgPat = (($this.Ctrl -band 0x10) -ne 0) ? 0x1000 : 0
-                [int] $plane = $bgPat + ($tile * 16) + $fineY
-                $this.BgTileLo = $mapper.PpuRead([ushort]$plane)
-                $this.BgTileHi = $mapper.PpuRead([ushort]($plane + 8))
-                $this.BgCachedTile = $tileStep
-            }
-            [int] $bit = 7 - ($fineXPos -band 7)
-            [int] $px = (($this.BgTileLo -shr $bit) -band 1) -bor ((($this.BgTileHi -shr $bit) -band 1) -shl 1)
+            [int] $bit = 15 - $this.FineX
+            [int] $px = (($this.BgShiftLo -shr $bit) -band 1) -bor ((($this.BgShiftHi -shr $bit) -band 1) -shl 1)
             if ($px -ne 0) {
+                [int] $pal = (($this.BgAttrLo -shr $bit) -band 1) -bor ((($this.BgAttrHi -shr $bit) -band 1) -shl 1)
                 $bgSolid = $true
-                $bgColor = $this.Palette[($this.BgTilePal * 4) + $px]
+                $bgColor = $this.Palette[($pal * 4) + $px]
             }
         }
 
@@ -886,22 +891,11 @@ class Ppu {
         [bool] $sprBehind = $false
         [bool] $sprZero = $false
         if (($this.Mask -band 0x10) -ne 0 -and ($x -ge 8 -or ($this.Mask -band 0x04) -ne 0)) {
-            for ([int] $s = 0; $s -lt $this.SprCount; $s++) {
-                [int] $sx = $this.SprX[$s]
-                if ($x -ge $sx -and $x -lt ($sx + 8)) {
-                    [int] $attr = $this.SprAttr[$s]
-                    [int] $col = $x - $sx
-                    if (($attr -band 0x40) -ne 0) { $col = 7 - $col }
-                    [int] $bit = 7 - $col
-                    [int] $px = (($this.SprLo[$s] -shr $bit) -band 1) -bor ((($this.SprHi[$s] -shr $bit) -band 1) -shl 1)
-                    if ($px -ne 0) {
-                        $sprOpaque = $true
-                        $sprColor = $this.Palette[0x10 + (($attr -band 3) * 4) + $px]
-                        $sprBehind = ($attr -band 0x20) -ne 0
-                        $sprZero = $this.SprIs0[$s]
-                        break
-                    }
-                }
+            if ($this.SprLineOpaque[$x]) {
+                $sprOpaque = $true
+                $sprColor = $this.SprLineColor[$x]
+                $sprBehind = $this.SprLineBehind[$x]
+                $sprZero = $this.SprLineIs0[$x]
             }
         }
 
@@ -920,14 +914,69 @@ class Ppu {
         $this.Pixels[$y * 256 + $x] = $finalColor
     }
 
+    [void] LoadBgShiftRegisters() {
+        $this.BgShiftLo = ($this.BgShiftLo -band 0xFF00) -bor ($this.BgNextLo -band 0xFF)
+        $this.BgShiftHi = ($this.BgShiftHi -band 0xFF00) -bor ($this.BgNextHi -band 0xFF)
+        $this.BgAttrLo = ($this.BgAttrLo -band 0xFF00) -bor ((($this.BgNextAttr -band 1) -ne 0) ? 0xFF : 0x00)
+        $this.BgAttrHi = ($this.BgAttrHi -band 0xFF00) -bor ((($this.BgNextAttr -band 2) -ne 0) ? 0xFF : 0x00)
+    }
+
     [void] AdvanceDots([int] $dots) {
+        [Mapper] $mapper = $this.Rom.EnsureMapper()
         for ([int] $i = 0; $i -lt $dots; $i++) {
             $this.TotalDots++
             $this.Cycle++
             if (($this.Mask -band 0x18) -ne 0 -and ($this.Scanline -lt 240 -or $this.Scanline -eq 261)) {
+                if ($this.Scanline -lt 240 -and $this.Cycle -eq 1 -and -not $this.BgPrefetched) {
+                    [ushort] $ntAddr0 = [ushort](0x2000 -bor ($this.VramAddr -band 0x0FFF))
+                    [int] $t0 = $this.ReadVram($ntAddr0)
+                    [ushort] $atAddr0 = [ushort](0x23C0 -bor ($this.VramAddr -band 0x0C00) -bor (($this.VramAddr -shr 4) -band 0x38) -bor (($this.VramAddr -shr 2) -band 0x07))
+                    [int] $ab0 = $this.ReadVram($atAddr0)
+                    [int] $q0 = ((($this.VramAddr -shr 5) -band 2) -bor (($this.VramAddr -band 2) -shr 1))
+                    [int] $pal0 = ($ab0 -shr ($q0 * 2)) -band 3
+                    [int] $bgPat0 = (($this.Ctrl -band 0x10) -ne 0) ? 0x1000 : 0
+                    [int] $fineY0 = ($this.VramAddr -shr 12) -band 7
+                    [int] $lo0 = $mapper.PpuRead([ushort]($bgPat0 + ($t0 * 16) + $fineY0))
+                    [int] $hi0 = $mapper.PpuRead([ushort]($bgPat0 + ($t0 * 16) + $fineY0 + 8))
+                    $this.BgShiftLo = ($lo0 -shl 8)
+                    $this.BgShiftHi = ($hi0 -shl 8)
+                    $this.BgAttrLo = ((($pal0 -band 1) -ne 0) ? 0xFF00 : 0)
+                    $this.BgAttrHi = ((($pal0 -band 2) -ne 0) ? 0xFF00 : 0)
+                }
                 if ($this.Scanline -lt 240 -and $this.Cycle -ge 1 -and $this.Cycle -le 256) {
                     $this.RenderDot($this.Cycle - 1, $this.Scanline)
-                    if (($this.Cycle -band 7) -eq 0) {
+                }
+
+                if (($this.Cycle -ge 1 -and $this.Cycle -le 256) -or ($this.Cycle -ge 321 -and $this.Cycle -le 336)) {
+                    $this.BgShiftLo = ($this.BgShiftLo -shl 1) -band 0xFFFF
+                    $this.BgShiftHi = ($this.BgShiftHi -shl 1) -band 0xFFFF
+                    $this.BgAttrLo = ($this.BgAttrLo -shl 1) -band 0xFFFF
+                    $this.BgAttrHi = ($this.BgAttrHi -shl 1) -band 0xFFFF
+
+                    [int] $phase = $this.Cycle -band 7
+                    if ($phase -eq 1) {
+                        [ushort] $ntAddr = [ushort](0x2000 -bor ($this.VramAddr -band 0x0FFF))
+                        $this.BgNextTile = $this.ReadVram($ntAddr)
+                    } elseif ($phase -eq 3) {
+                        [ushort] $atAddr = [ushort](0x23C0 -bor ($this.VramAddr -band 0x0C00) -bor (($this.VramAddr -shr 4) -band 0x38) -bor (($this.VramAddr -shr 2) -band 0x07))
+                        [int] $atByte = $this.ReadVram($atAddr)
+                        [int] $quad = ((($this.VramAddr -shr 5) -band 2) -bor (($this.VramAddr -band 2) -shr 1))
+                        $this.BgNextAttr = ($atByte -shr ($quad * 2)) -band 3
+                    } elseif ($phase -eq 5) {
+                        [int] $bgPat = (($this.Ctrl -band 0x10) -ne 0) ? 0x1000 : 0
+                        [int] $fineY = ($this.VramAddr -shr 12) -band 7
+                        [ushort] $patLoAddr = [ushort]($bgPat + ($this.BgNextTile * 16) + $fineY)
+                        $mapper.ObservePpuAddress($patLoAddr, $this.TotalDots)
+                        $this.BgNextLo = $mapper.PpuRead($patLoAddr)
+                    } elseif ($phase -eq 7) {
+                        [int] $bgPat = (($this.Ctrl -band 0x10) -ne 0) ? 0x1000 : 0
+                        [int] $fineY = ($this.VramAddr -shr 12) -band 7
+                        [ushort] $patHiAddr = [ushort]($bgPat + ($this.BgNextTile * 16) + $fineY + 8)
+                        $mapper.ObservePpuAddress($patHiAddr, $this.TotalDots)
+                        $this.BgNextHi = $mapper.PpuRead($patHiAddr)
+                    } elseif ($phase -eq 0) {
+                        $this.LoadBgShiftRegisters()
+                        if ($this.Cycle -ge 321) { $this.BgPrefetched = $true }
                         if (($this.VramAddr -band 0x001F) -eq 31) {
                             $this.VramAddr = ($this.VramAddr -band 0xFFE0) -bxor 0x0400
                         } else {
@@ -935,6 +984,7 @@ class Ppu {
                         }
                     }
                 }
+
                 if ($this.Cycle -eq 256 -and $this.Scanline -lt 240) {
                     if (($this.VramAddr -band 0x7000) -ne 0x7000) {
                         $this.VramAddr += 0x1000
@@ -948,16 +998,24 @@ class Ppu {
                     }
                 } elseif ($this.Cycle -eq 257 -and $this.Scanline -lt 240) {
                     $this.VramAddr = ($this.VramAddr -band 0xFBE0) -bor ($this.TempAddr -band 0x041F)
+                    $this.BgPrefetched = $false
                 } elseif ($this.Scanline -eq 261 -and $this.Cycle -eq 280) {
                     $this.VramAddr = ($this.VramAddr -band 0x841F) -bor ($this.TempAddr -band 0x7BE0)
                 }
 
                 if ($this.Cycle -ge 257 -and $this.Cycle -le 320) {
-                    [ushort] $sprAddr = (($this.Ctrl -band 0x28) -ne 0) ? [ushort]0x1000 : [ushort]0x0000
-                    $this.Rom.EnsureMapper().ObservePpuAddress($sprAddr, $this.TotalDots)
-                } elseif (($this.Cycle -ge 1 -and $this.Cycle -le 256) -or ($this.Cycle -ge 321 -and $this.Cycle -le 336)) {
-                    [ushort] $bgAddr = (($this.Ctrl -band 0x10) -ne 0) ? [ushort]0x1000 : [ushort]0x0000
-                    $this.Rom.EnsureMapper().ObservePpuAddress($bgAddr, $this.TotalDots)
+                    [int] $sprSlot = ($this.Cycle - 257) -shr 3
+                    [int] $sprPhase = ($this.Cycle - 257) -band 7
+                    if ($sprPhase -eq 5 -or $sprPhase -eq 7) {
+                        [ushort] $sprAddr = (($this.Ctrl -band 0x28) -ne 0) ? [ushort]0x1000 : [ushort]0x0000
+                        if ($sprSlot -lt $this.SprCount) {
+                            [int] $sprH = (($this.Ctrl -band 0x20) -ne 0) ? 16 : 8
+                            [int] $sTile = $this.SprTile[$sprSlot]
+                            [int] $sBase = ($sprH -eq 16) ? ((($sTile -band 1) -ne 0) ? 0x1000 : 0) : ((($this.Ctrl -band 0x08) -ne 0) ? 0x1000 : 0)
+                            $sprAddr = [ushort]($sBase + ($sTile * 16) + (($sprPhase -eq 7) ? 8 : 0))
+                        }
+                        $mapper.ObservePpuAddress($sprAddr, $this.TotalDots)
+                    }
                 }
             } elseif ($this.Scanline -lt 240 -and $this.Cycle -ge 1 -and $this.Cycle -le 256) {
                 $this.Pixels[$this.Scanline * 256 + ($this.Cycle - 1)] = $this.Palette[0]
