@@ -27,6 +27,7 @@ class Mapper {
 
     [byte] CpuRead([ushort] $address) { return 0 }
     [void] CpuWrite([ushort] $address, [byte] $value) { }
+    [void] CpuWriteAt([ushort] $address, [byte] $value, [long] $cpuCycle) { $this.CpuWrite($address, $value) }
     [byte] SramRead([ushort] $address, [byte[]] $sram) { return $sram[$address - 0x6000] }
     [void] SramWrite([ushort] $address, [byte] $value, [byte[]] $sram) { $sram[$address - 0x6000] = $value }
     [byte] PpuRead([ushort] $address) { return 0 }
@@ -72,6 +73,7 @@ class Mapper1 : Mapper {
     [byte] $ChrBank0 = 0
     [byte] $ChrBank1 = 0
     [byte] $PrgBank = 0
+    [long] $LastWriteCycle = -2
 
     Mapper1([Rom] $rom) : base($rom) { }
 
@@ -103,6 +105,16 @@ class Mapper1 : Mapper {
             }
         }
         return $this.Rom.PrgRom[$offset % $prgLen]
+    }
+
+    [void] CpuWriteAt([ushort] $address, [byte] $value, [long] $cpuCycle) {
+        if ($address -lt 0x8000) { return }
+        if ($this.LastWriteCycle -ge 0 -and ($cpuCycle - $this.LastWriteCycle) -eq 1) {
+            $this.LastWriteCycle = $cpuCycle
+            return
+        }
+        $this.LastWriteCycle = $cpuCycle
+        $this.CpuWrite($address, $value)
     }
 
     [void] CpuWrite([ushort] $address, [byte] $value) {
@@ -203,7 +215,7 @@ class Mapper2 : Mapper {
 
     [void] CpuWrite([ushort] $address, [byte] $value) {
         if ($address -ge 0x8000) {
-            [byte] $effective = $value -band $this.CpuRead($address)
+            [byte] $effective = ($this.Rom.Submapper -ne 1) ? ($value -band $this.CpuRead($address)) : $value
             $this.PrgBank = $effective -band 0x0F
         }
     }
@@ -242,7 +254,7 @@ class Mapper3 : Mapper {
 
     [void] CpuWrite([ushort] $address, [byte] $value) {
         if ($address -ge 0x8000) {
-            [byte] $effective = $value -band $this.CpuRead($address)
+            [byte] $effective = ($this.Rom.Submapper -ne 1) ? ($value -band $this.CpuRead($address)) : $value
             $this.ChrBank = $effective -band 0x03
         }
     }
@@ -578,7 +590,9 @@ class Rom {
         } else {
             # Uses CHR-RAM. Keep this separate from the storage length: an
             # 8 KiB CHR-ROM is not writable, while CHR-RAM is.
-            $this.ChrRom = [byte[]]::new(8192)
+            [int] $chrRamBytes = $this.ChrRamSize + $this.ChrNvramSize
+            if ($chrRamBytes -le 0) { $chrRamBytes = 8192 }
+            $this.ChrRom = [byte[]]::new($chrRamBytes)
             $this.ChrRam = $true
         }
 
@@ -929,7 +943,9 @@ class Memory {
 
     Memory([Rom] $rom) {
         $this.Ram = [byte[]]::new(2048)
-        $this.Sram = [byte[]]::new(8192)
+        [int] $sramBytes = $rom.PrgRamSize + $rom.PrgNvramSize
+        if ($sramBytes -le 0) { $sramBytes = 8192 }
+        $this.Sram = [byte[]]::new($sramBytes)
         $this.Rom = $rom
     }
     
@@ -994,7 +1010,11 @@ class Memory {
         } elseif ($address -ge 0x6000 -and $address -lt 0x8000) {
             $this.Rom.EnsureMapper().SramWrite($address, $value, $this.Sram)
         } elseif ($address -ge 0x8000) {
-            $this.Rom.EnsureMapper().CpuWrite($address, $value)
+            if ($null -ne $this.Cpu) {
+                $this.Rom.EnsureMapper().CpuWriteAt($address, $value, $this.Cpu._cpuCycleBase + $this.Cpu.instrBusCycles)
+            } else {
+                $this.Rom.EnsureMapper().CpuWrite($address, $value)
+            }
         }
     }
     
@@ -2928,6 +2948,7 @@ class Cpu6502 {
     }
 
     [void] DoIrq([int] $status) {
+        $this.Ppu.AdvanceDots(6)
         $this.REG_PC_NEW = ($this.REG_PC_NEW + 1) -band 0xFFFF
         $this.Push([byte](($this.REG_PC_NEW -shr 8) -band 0xFF))
         $this.Push([byte]($this.REG_PC_NEW -band 0xFF))
