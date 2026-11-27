@@ -3028,6 +3028,44 @@ class Cpu6502 {
 
 }
 
+class MachineSnapshot {
+    [byte[]] $Ram
+    [byte[]] $Sram
+    [byte[]] $Vram
+    [byte[]] $Palette
+    [byte[]] $Oam
+    [byte[]] $ChrRamData
+    [int] $Scanline
+    [int] $Cycle
+    [long] $TotalDots
+    [byte] $Ctrl
+    [byte] $Mask
+    [byte] $Status
+    [byte] $OamAddr
+    [byte] $ScrollX
+    [byte] $ScrollY
+    [ushort] $VramAddr
+    [ushort] $TempAddr
+    [byte] $FineX
+    [bool] $WriteToggle
+    [byte] $DataBuffer
+    [int] $REG_ACC
+    [int] $REG_X
+    [int] $REG_Y
+    [int] $REG_SP
+    [int] $REG_PC
+    [int] $F_CARRY
+    [int] $F_ZERO
+    [int] $F_INTERRUPT
+    [int] $F_DECIMAL
+    [int] $F_BRK
+    [int] $F_OVERFLOW
+    [int] $F_SIGN
+    [long] $CpuCycleBase
+    [bool] $NmiRaised
+    [bool] $NmiPending
+}
+
 class Nes {
     [Cpu6502] $Cpu
     [Ppu] $Ppu
@@ -3063,6 +3101,96 @@ class Nes {
             [void]$this.Cpu.Emulate()
         }
         $this.Ppu.FrameEnded = $false
+    }
+
+    [MachineSnapshot] CaptureSnapshot() {
+        [MachineSnapshot] $s = [MachineSnapshot]::new()
+        $s.Ram = [byte[]]::new($this.Memory.Ram.Length)
+        [Array]::Copy($this.Memory.Ram, $s.Ram, $this.Memory.Ram.Length)
+        $s.Sram = [byte[]]::new($this.Memory.Sram.Length)
+        if ($this.Memory.Sram.Length -gt 0) { [Array]::Copy($this.Memory.Sram, $s.Sram, $this.Memory.Sram.Length) }
+        $s.Vram = [byte[]]::new($this.Ppu.Vram.Length)
+        [Array]::Copy($this.Ppu.Vram, $s.Vram, $this.Ppu.Vram.Length)
+        $s.Palette = [byte[]]::new($this.Ppu.Palette.Length)
+        [Array]::Copy($this.Ppu.Palette, $s.Palette, $this.Ppu.Palette.Length)
+        $s.Oam = [byte[]]::new($this.Ppu.Oam.Length)
+        [Array]::Copy($this.Ppu.Oam, $s.Oam, $this.Ppu.Oam.Length)
+        if ($this.Rom.ChrRam -and $null -ne $this.Rom.ChrRom) {
+            $s.ChrRamData = [byte[]]::new($this.Rom.ChrRom.Length)
+            [Array]::Copy($this.Rom.ChrRom, $s.ChrRamData, $this.Rom.ChrRom.Length)
+        }
+        $s.Scanline = $this.Ppu.Scanline
+        $s.Cycle = $this.Ppu.Cycle
+        $s.TotalDots = $this.Ppu.TotalDots
+        $s.Ctrl = $this.Ppu.Ctrl
+        $s.Mask = $this.Ppu.Mask
+        $s.Status = $this.Ppu.Status
+        $s.OamAddr = $this.Ppu.OamAddr
+        $s.ScrollX = $this.Ppu.ScrollX
+        $s.ScrollY = $this.Ppu.ScrollY
+        $s.VramAddr = $this.Ppu.VramAddr
+        $s.TempAddr = $this.Ppu.TempAddr
+        $s.FineX = $this.Ppu.FineX
+        $s.WriteToggle = $this.Ppu.WriteToggle
+        $s.DataBuffer = $this.Ppu.DataBuffer
+        $s.REG_ACC = $this.Cpu.REG_ACC
+        $s.REG_X = $this.Cpu.REG_X
+        $s.REG_Y = $this.Cpu.REG_Y
+        $s.REG_SP = $this.Cpu.REG_SP
+        $s.REG_PC = $this.Cpu.REG_PC
+        $s.F_CARRY = $this.Cpu.F_CARRY
+        $s.F_ZERO = $this.Cpu.F_ZERO
+        $s.F_INTERRUPT = $this.Cpu.F_INTERRUPT
+        $s.F_DECIMAL = $this.Cpu.F_DECIMAL
+        $s.F_BRK = $this.Cpu.F_BRK
+        $s.F_OVERFLOW = $this.Cpu.F_OVERFLOW
+        $s.F_SIGN = $this.Cpu.F_SIGN
+        $s.CpuCycleBase = $this.Cpu._cpuCycleBase
+        $s.NmiRaised = $this.Cpu.nmiRaised
+        $s.NmiPending = $this.Cpu.nmiPending
+        return $s
+    }
+
+    [void] RestoreSnapshot([MachineSnapshot] $s) {
+        [Array]::Copy($s.Ram, $this.Memory.Ram, $this.Memory.Ram.Length)
+        if ($this.Memory.Sram.Length -gt 0 -and $s.Sram.Length -eq $this.Memory.Sram.Length) {
+            [Array]::Copy($s.Sram, $this.Memory.Sram, $this.Memory.Sram.Length)
+        }
+        [Array]::Copy($s.Vram, $this.Ppu.Vram, $this.Ppu.Vram.Length)
+        [Array]::Copy($s.Palette, $this.Ppu.Palette, $this.Ppu.Palette.Length)
+        [Array]::Copy($s.Oam, $this.Ppu.Oam, $this.Ppu.Oam.Length)
+        if ($this.Rom.ChrRam -and $null -ne $s.ChrRamData -and $null -ne $this.Rom.ChrRom) {
+            [Array]::Copy($s.ChrRamData, $this.Rom.ChrRom, $this.Rom.ChrRom.Length)
+        }
+        $this.Ppu.Scanline = $s.Scanline
+        $this.Ppu.Cycle = $s.Cycle
+        $this.Ppu.TotalDots = $s.TotalDots
+        $this.Ppu.Ctrl = $s.Ctrl
+        $this.Ppu.Mask = $s.Mask
+        $this.Ppu.Status = $s.Status
+        $this.Ppu.OamAddr = $s.OamAddr
+        $this.Ppu.ScrollX = $s.ScrollX
+        $this.Ppu.ScrollY = $s.ScrollY
+        $this.Ppu.VramAddr = $s.VramAddr
+        $this.Ppu.TempAddr = $s.TempAddr
+        $this.Ppu.FineX = $s.FineX
+        $this.Ppu.WriteToggle = $s.WriteToggle
+        $this.Ppu.DataBuffer = $s.DataBuffer
+        $this.Cpu.REG_ACC = $s.REG_ACC
+        $this.Cpu.REG_X = $s.REG_X
+        $this.Cpu.REG_Y = $s.REG_Y
+        $this.Cpu.REG_SP = $s.REG_SP
+        $this.Cpu.REG_PC = $s.REG_PC
+        $this.Cpu.F_CARRY = $s.F_CARRY
+        $this.Cpu.F_ZERO = $s.F_ZERO
+        $this.Cpu.F_INTERRUPT = $s.F_INTERRUPT
+        $this.Cpu.F_DECIMAL = $s.F_DECIMAL
+        $this.Cpu.F_BRK = $s.F_BRK
+        $this.Cpu.F_OVERFLOW = $s.F_OVERFLOW
+        $this.Cpu.F_SIGN = $s.F_SIGN
+        $this.Cpu._cpuCycleBase = $s.CpuCycleBase
+        $this.Cpu.nmiRaised = $s.NmiRaised
+        $this.Cpu.nmiPending = $s.NmiPending
     }
 }
 
@@ -3834,6 +3962,19 @@ Case 'controller index post-shift behavior' {
     $r.Mem.SetControllerState(1,0); $r.Mem.Write(0x4016,1); $r.Mem.Write(0x4016,0)
     for($i=0;$i-lt 8;$i++){ [void]$r.Mem.Read(0x4016) }
     Assert-Equal 1 $r.Mem.Read(0x4016) 'controller post-shift'
+}
+Case 'machine snapshot capture and restore determinism' {
+    $n = [Nes]::new()
+    $n.Rom.PrgRom = [byte[]]::new(32768); $n.Rom.ChrRom = [byte[]]::new(8192); $n.Rom.ChrRam = $true; $n.Rom.IsValid = $true
+    $n.Rom.PrgRom[0] = 0xE6; $n.Rom.PrgRom[1] = 0x00; $n.Rom.PrgRom[2] = 0x4C; $n.Rom.PrgRom[3] = 0x00; $n.Rom.PrgRom[4] = 0x80
+    $n.Rom.PrgRom[0x7FFC] = 0x00; $n.Rom.PrgRom[0x7FFD] = 0x80
+    $n.PowerOn()
+    $n.RunFrame()
+    $snap = $n.CaptureSnapshot()
+    $n.RunFrame(); $ram1 = [PsnesBench]::Checksum($n.Memory.Ram)
+    $n.RestoreSnapshot($snap)
+    $n.RunFrame(); $ram2 = [PsnesBench]::Checksum($n.Memory.Ram)
+    Assert-Equal $ram1 $ram2 'snapshot restore produces identical RAM checksum'
 }
 $results | Format-Table -AutoSize
 if (@($results | Where-Object Result -eq 'FAIL').Count -gt 0) { exit 1 }
