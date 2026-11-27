@@ -3140,6 +3140,51 @@ class MachineSnapshot {
     [long] $CpuCycleBase
     [bool] $NmiRaised
     [bool] $NmiPending
+    [byte] $Controller1
+    [byte] $Controller2
+    [byte] $Controller1Index
+    [byte] $Controller2Index
+    [bool] $ControllerStrobe
+    [byte[]] $Pixels
+    [int] $BgShiftLo
+    [int] $BgShiftHi
+    [int] $BgAttrLo
+    [int] $BgAttrHi
+    [int] $BgNextTile
+    [int] $BgNextAttr
+    [int] $BgNextLo
+    [int] $BgNextHi
+    [bool] $BgPrefetched
+    [int] $MapperId
+    [int[]] $MapperInts
+    [long] $MapperLong
+    [bool] $MapperBool
+}
+
+class NesObservation {
+    [int] $FrameIndex
+    [long] $TotalDots
+    [long] $TotalCycles
+    [int] $A
+    [int] $X
+    [int] $Y
+    [int] $SP
+    [int] $PC
+    [byte] $Ctrl
+    [byte] $Mask
+    [byte] $Status
+    [byte] $ScrollX
+    [byte] $ScrollY
+    [ushort] $VramAddr
+    [byte] $FineX
+    [byte] $Controller1
+    [byte] $Controller2
+    [byte[]] $Ram
+    [byte[]] $Oam
+    [byte[]] $Vram
+    [byte[]] $Palette
+    [byte[]] $Pixels
+    [int[]] $PixelSource
 }
 
 class Nes {
@@ -3190,6 +3235,60 @@ class Nes {
         }
     }
 
+    [Nes] Branch([MachineSnapshot] $snapshot) {
+        [Nes] $child = [Nes]::new()
+        $child.Rom.PrgRom = $this.Rom.PrgRom
+        if ($this.Rom.ChrRam -and $null -ne $this.Rom.ChrRom) {
+            $child.Rom.ChrRom = [byte[]]::new($this.Rom.ChrRom.Length)
+            [Array]::Copy($this.Rom.ChrRom, $child.Rom.ChrRom, $this.Rom.ChrRom.Length)
+        } else {
+            $child.Rom.ChrRom = $this.Rom.ChrRom
+        }
+        $child.Rom.ChrRam = $this.Rom.ChrRam
+        $child.Rom.Mapper = $this.Rom.Mapper
+        $child.Rom.Submapper = $this.Rom.Submapper
+        $child.Rom.Mirroring = $this.Rom.Mirroring
+        $child.Rom.IsNes2 = $this.Rom.IsNes2
+        $child.Rom.PrgRamSize = $this.Rom.PrgRamSize
+        $child.Rom.PrgNvramSize = $this.Rom.PrgNvramSize
+        $child.Rom.IsValid = $this.Rom.IsValid
+        $child.PowerOn()
+        $child.RestoreSnapshot($snapshot)
+        return $child
+    }
+
+    [NesObservation] CaptureObservation([int] $frameIndex) {
+        [NesObservation] $obs = [NesObservation]::new()
+        $obs.FrameIndex = $frameIndex
+        $obs.TotalDots = $this.Ppu.TotalDots
+        $obs.TotalCycles = $this.Cpu._cpuCycleBase
+        $obs.A = $this.Cpu.REG_ACC
+        $obs.X = $this.Cpu.REG_X
+        $obs.Y = $this.Cpu.REG_Y
+        $obs.SP = $this.Cpu.REG_SP
+        $obs.PC = $this.Cpu.REG_PC
+        $obs.Ctrl = $this.Ppu.Ctrl
+        $obs.Mask = $this.Ppu.Mask
+        $obs.Status = $this.Ppu.Status
+        $obs.ScrollX = $this.Ppu.ScrollX
+        $obs.ScrollY = $this.Ppu.ScrollY
+        $obs.VramAddr = $this.Ppu.VramAddr
+        $obs.FineX = $this.Ppu.FineX
+        $obs.Controller1 = $this.Memory.Controller1
+        $obs.Controller2 = $this.Memory.Controller2
+        $obs.Ram = [byte[]]::new($this.Memory.Ram.Length)
+        [Array]::Copy($this.Memory.Ram, $obs.Ram, $this.Memory.Ram.Length)
+        $obs.Oam = [byte[]]::new($this.Ppu.Oam.Length)
+        [Array]::Copy($this.Ppu.Oam, $obs.Oam, $this.Ppu.Oam.Length)
+        $obs.Vram = [byte[]]::new($this.Ppu.Vram.Length)
+        [Array]::Copy($this.Ppu.Vram, $obs.Vram, $this.Ppu.Vram.Length)
+        $obs.Palette = [byte[]]::new($this.Ppu.Palette.Length)
+        [Array]::Copy($this.Ppu.Palette, $obs.Palette, $this.Ppu.Palette.Length)
+        $obs.Pixels = [byte[]]::new($this.Ppu.Pixels.Length)
+        [Array]::Copy($this.Ppu.Pixels, $obs.Pixels, $this.Ppu.Pixels.Length)
+        return $obs
+    }
+
     [MachineSnapshot] CaptureSnapshot() {
         [MachineSnapshot] $s = [MachineSnapshot]::new()
         $s.Ram = [byte[]]::new($this.Memory.Ram.Length)
@@ -3235,6 +3334,22 @@ class Nes {
         $s.CpuCycleBase = $this.Cpu._cpuCycleBase
         $s.NmiRaised = $this.Cpu.nmiRaised
         $s.NmiPending = $this.Cpu.nmiPending
+        $s.Controller1 = $this.Memory.Controller1
+        $s.Controller2 = $this.Memory.Controller2
+        $s.Controller1Index = $this.Memory.Controller1Index
+        $s.Controller2Index = $this.Memory.Controller2Index
+        $s.ControllerStrobe = $this.Memory.ControllerStrobe
+        $s.Pixels = [byte[]]::new($this.Ppu.Pixels.Length)
+        [Array]::Copy($this.Ppu.Pixels, $s.Pixels, $this.Ppu.Pixels.Length)
+        $s.BgShiftLo = $this.Ppu.BgShiftLo
+        $s.BgShiftHi = $this.Ppu.BgShiftHi
+        $s.BgAttrLo = $this.Ppu.BgAttrLo
+        $s.BgAttrHi = $this.Ppu.BgAttrHi
+        $s.BgNextTile = $this.Ppu.BgNextTile
+        $s.BgNextAttr = $this.Ppu.BgNextAttr
+        $s.BgNextLo = $this.Ppu.BgNextLo
+        $s.BgNextHi = $this.Ppu.BgNextHi
+        $s.BgPrefetched = $this.Ppu.BgPrefetched
         return $s
     }
 
@@ -4115,6 +4230,24 @@ Case 'PPU CachedMapper matches Rom.EnsureMapper after PowerOn' {
     $n.Rom.Mapper = 4; $n.Rom.MapperImpl = $null
     $n.PowerOn()
     Assert-Equal $true ([object]::ReferenceEquals($n.Ppu.CachedMapper, $n.Rom.EnsureMapper())) 'MMC3 PPU CachedMapper identity after reload'
+}
+Case 'independent Nes.Branch and NesObservation capture' {
+    $n = [Nes]::new()
+    $n.Rom.PrgRom = [byte[]]::new(32768); $n.Rom.ChrRom = [byte[]]::new(8192); $n.Rom.ChrRam = $true; $n.Rom.IsValid = $true
+    $n.Rom.PrgRom[0] = 0xE6; $n.Rom.PrgRom[1] = 0x00; $n.Rom.PrgRom[2] = 0x4C; $n.Rom.PrgRom[3] = 0x00; $n.Rom.PrgRom[4] = 0x80
+    $n.Rom.PrgRom[0x7FFC] = 0x00; $n.Rom.PrgRom[0x7FFD] = 0x80
+    $n.PowerOn()
+    $n.RunFrame()
+    $snap = $n.CaptureSnapshot()
+    $branch = $n.Branch($snap)
+    $n.RunFrame()
+    $branch.RunFrame()
+    Assert-Equal ([PsnesBench]::Checksum($n.Memory.Ram)) ([PsnesBench]::Checksum($branch.Memory.Ram)) 'branched Nes RAM parity'
+    Assert-Equal ([PsnesBench]::Checksum($n.Ppu.Pixels)) ([PsnesBench]::Checksum($branch.Ppu.Pixels)) 'branched Nes FB parity'
+    $obs = $branch.CaptureObservation(2)
+    Assert-Equal 2 $obs.FrameIndex 'observation frame index'
+    Assert-Equal 2048 $obs.Ram.Length 'observation RAM length'
+    Assert-Equal 61440 $obs.Pixels.Length 'observation Pixels length'
 }
 $results | Format-Table -AutoSize
 if (@($results | Where-Object Result -eq 'FAIL').Count -gt 0) { exit 1 }
