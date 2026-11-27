@@ -77,24 +77,27 @@ class Mapper1 : Mapper {
         if ($address -lt 0x8000 -or -not $this.Rom.IsValid -or $null -eq $this.Rom.PrgRom -or $this.Rom.PrgRom.Length -eq 0) { return 0 }
         [int] $prgLen = $this.Rom.PrgRom.Length
         [int] $bankCount = [Math]::Max(1, [int]($prgLen / 16384))
+        [int] $outer16 = ($prgLen -ge 524288) ? ($this.ChrBank0 -band 0x10) : 0
         [int] $mode = ($this.Control -shr 2) -band 0x03
         [int] $offset = 0
         if ($mode -eq 0 -or $mode -eq 1) {
-            [int] $bank32 = (($this.PrgBank -band 0x0E) -shr 1) % [Math]::Max(1, [int]($prgLen / 32768))
+            [int] $bank32 = (($outer16 -bor ($this.PrgBank -band 0x0E)) -shr 1) % [Math]::Max(1, [int]($prgLen / 32768))
             $offset = ($bank32 * 32768) + ($address - 0x8000)
         } elseif ($mode -eq 2) {
             if ($address -lt 0xC000) {
-                $offset = $address - 0x8000
+                [int] $bank = $outer16 % $bankCount
+                $offset = ($bank * 16384) + ($address - 0x8000)
             } else {
-                [int] $bank = ($this.PrgBank -band 0x0F) % $bankCount
+                [int] $bank = ($outer16 -bor ($this.PrgBank -band 0x0F)) % $bankCount
                 $offset = ($bank * 16384) + ($address - 0xC000)
             }
         } else {
             if ($address -lt 0xC000) {
-                [int] $bank = ($this.PrgBank -band 0x0F) % $bankCount
+                [int] $bank = ($outer16 -bor ($this.PrgBank -band 0x0F)) % $bankCount
                 $offset = ($bank * 16384) + ($address - 0x8000)
             } else {
-                $offset = (($bankCount - 1) * 16384) + ($address - 0xC000)
+                [int] $lastIn256 = ($prgLen -ge 524288) ? ($outer16 -bor 0x0F) : ($bankCount - 1)
+                $offset = (($lastIn256 % $bankCount) * 16384) + ($address - 0xC000)
             }
         }
         return $this.Rom.PrgRom[$offset % $prgLen]
@@ -198,7 +201,8 @@ class Mapper2 : Mapper {
 
     [void] CpuWrite([ushort] $address, [byte] $value) {
         if ($address -ge 0x8000) {
-            $this.PrgBank = $value -band 0x0F
+            [byte] $effective = $value -band $this.CpuRead($address)
+            $this.PrgBank = $effective -band 0x0F
         }
     }
 
@@ -236,7 +240,8 @@ class Mapper3 : Mapper {
 
     [void] CpuWrite([ushort] $address, [byte] $value) {
         if ($address -ge 0x8000) {
-            $this.ChrBank = $value -band 0x03
+            [byte] $effective = $value -band $this.CpuRead($address)
+            $this.ChrBank = $effective -band 0x03
         }
     }
 
@@ -403,8 +408,9 @@ class Mapper66 : Mapper {
 
     [void] CpuWrite([ushort] $address, [byte] $value) {
         if ($address -ge 0x8000) {
-            $this.PrgBank = ($value -shr 4) -band 0x03
-            $this.ChrBank = $value -band 0x03
+            [byte] $effective = $value -band $this.CpuRead($address)
+            $this.PrgBank = ($effective -shr 4) -band 0x03
+            $this.ChrBank = $effective -band 0x03
         }
     }
 
@@ -436,8 +442,9 @@ class Mapper7 : Mapper {
 
     [void] CpuWrite([ushort] $address, [byte] $value) {
         if ($address -ge 0x8000) {
-            $this.PrgBank = $value -band 0x07
-            $this.MirrorMode = (($value -band 0x10) -ne 0) ? [Mirroring]::SingleScreenUpper : [Mirroring]::SingleScreen
+            [byte] $effective = ($this.Rom.Submapper -eq 2) ? ($value -band $this.CpuRead($address)) : $value
+            $this.PrgBank = $effective -band 0x07
+            $this.MirrorMode = (($effective -band 0x10) -ne 0) ? [Mirroring]::SingleScreenUpper : [Mirroring]::SingleScreen
         }
     }
 
@@ -464,6 +471,11 @@ class Rom {
     [byte[]] $ChrRom
     [bool] $ChrRam
     [int] $Mapper
+    [int] $Submapper
+    [int] $PrgRamSize
+    [int] $PrgNvramSize
+    [int] $ChrRamSize
+    [int] $ChrNvramSize
     [Mirroring] $Mirroring
     [bool] $IsValid
     [bool] $HasBatteryBackedRam
@@ -508,10 +520,25 @@ class Rom {
         [byte] $control2 = $data[7]
         [bool] $isNes2 = ($control2 -band 0x0C) -eq 0x08
         [int] $mapperNumber = (($control2 -band 0xF0) -bor (($control1 -shr 4) -band 0x0F))
+        $this.Submapper = 0
+        $this.PrgRamSize = 0
+        $this.PrgNvramSize = 0
+        $this.ChrRamSize = 0
+        $this.ChrNvramSize = 0
         if ($isNes2) {
             $mapperNumber = $mapperNumber -bor (($data[8] -band 0x0F) -shl 8)
+            $this.Submapper = ($data[8] -shr 4) -band 0x0F
+            if ((($data[9] -band 0x0F) -eq 0x0F) -or (($data[9] -band 0xF0) -eq 0xF0)) { return $false }
             $prgBanks = $prgBanks -bor (($data[9] -band 0x0F) -shl 8)
             $chrBanks = $chrBanks -bor (($data[9] -band 0xF0) -shl 4)
+            [int] $prgRamShift = $data[10] -band 0x0F
+            [int] $prgNvramShift = ($data[10] -shr 4) -band 0x0F
+            [int] $chrRamShift = $data[11] -band 0x0F
+            [int] $chrNvramShift = ($data[11] -shr 4) -band 0x0F
+            if ($prgRamShift -gt 0) { $this.PrgRamSize = 64 -shl $prgRamShift }
+            if ($prgNvramShift -gt 0) { $this.PrgNvramSize = 64 -shl $prgNvramShift }
+            if ($chrRamShift -gt 0) { $this.ChrRamSize = 64 -shl $chrRamShift }
+            if ($chrNvramShift -gt 0) { $this.ChrNvramSize = 64 -shl $chrNvramShift }
         }
         if ($prgBanks -eq 0) { return $false }
         if ($mapperNumber -ne 0 -and $mapperNumber -ne 1 -and $mapperNumber -ne 2 -and $mapperNumber -ne 3 -and $mapperNumber -ne 4 -and $mapperNumber -ne 7 -and $mapperNumber -ne 66) { return $false }
@@ -3585,17 +3612,18 @@ Case 'MMC1 mapper 1 PRG banking and mirroring' {
 }
 Case 'UxROM mapper 2 PRG banking' {
     $r=New-Rig; $r.Rom.Mapper=2; $r.Rom.MapperImpl=$null
-    $r.Rom.PrgRom=[byte[]]::new(32768); $r.Rom.PrgRom[0]=0xAA; $r.Rom.PrgRom[16384]=0xBB
+    $r.Rom.PrgRom=[byte[]]::new(32768); $r.Rom.PrgRom[0]=0xAA; $r.Rom.PrgRom[1]=0xFF; $r.Rom.PrgRom[16384]=0xBB
     Assert-Equal 0xAA $r.Mem.Read(0x8000) 'UxROM initial bank 0'
     Assert-Equal 0xBB $r.Mem.Read(0xC000) 'UxROM fixed last bank'
-    $r.Mem.Write(0x8000, 1)
+    $r.Mem.Write(0x8001, 1)
     Assert-Equal 0xBB $r.Mem.Read(0x8000) 'UxROM switched bank 1'
 }
 Case 'CNROM mapper 3 CHR banking' {
     $r=New-Rig; $r.Rom.Mapper=3; $r.Rom.MapperImpl=$null
+    $r.Rom.PrgRom[1]=0xFF
     $r.Rom.ChrRom=[byte[]]::new(16384); $r.Rom.ChrRom[0]=0x12; $r.Rom.ChrRom[8192]=0x34
     Assert-Equal 0x12 $r.Ppu.ReadVram(0x0000) 'CNROM bank 0'
-    $r.Mem.Write(0x8000, 1)
+    $r.Mem.Write(0x8001, 1)
     Assert-Equal 0x34 $r.Ppu.ReadVram(0x0000) 'CNROM bank 1'
 }
 Case 'MMC1 mapper 1 32KB PRG banking modes 0 and 1 and SRAM gating' {
