@@ -1,4 +1,4 @@
-#requires -Version 7.0
+﻿#requires -Version 7.0
 
 [CmdletBinding()]
 param(
@@ -15,6 +15,268 @@ enum Mirroring {
     Vertical = 1
     FourScreen = 2
     SingleScreen = 3
+    SingleScreenUpper = 4
+}
+
+class Mapper {
+    [Rom] $Rom
+
+    Mapper([Rom] $rom) {
+        $this.Rom = $rom
+    }
+
+    [byte] CpuRead([ushort] $address) { return 0 }
+    [void] CpuWrite([ushort] $address, [byte] $value) { }
+    [byte] PpuRead([ushort] $address) { return 0 }
+    [void] PpuWrite([ushort] $address, [byte] $value) { }
+    [Mirroring] GetMirroring() { return $this.Rom.Mirroring }
+}
+
+class Mapper0 : Mapper {
+    Mapper0([Rom] $rom) : base($rom) { }
+
+    [byte] CpuRead([ushort] $address) {
+        if ($address -ge 0x8000 -and $this.Rom.IsValid -and $null -ne $this.Rom.PrgRom -and $this.Rom.PrgRom.Length -gt 0) {
+            [int] $prgAddr = $address - 0x8000
+            if ($this.Rom.PrgRom.Length -eq 16384) {
+                $prgAddr = $prgAddr % 16384
+            } else {
+                $prgAddr = $prgAddr % $this.Rom.PrgRom.Length
+            }
+            return $this.Rom.PrgRom[$prgAddr]
+        }
+        return 0
+    }
+
+    [byte] PpuRead([ushort] $address) {
+        if ($null -ne $this.Rom.ChrRom -and $this.Rom.ChrRom.Length -gt 0) {
+            return $this.Rom.ChrRom[$address % $this.Rom.ChrRom.Length]
+        }
+        return 0
+    }
+
+    [void] PpuWrite([ushort] $address, [byte] $value) {
+        if ($this.Rom.ChrRam -and $null -ne $this.Rom.ChrRom -and $this.Rom.ChrRom.Length -gt 0) {
+            $this.Rom.ChrRom[$address % $this.Rom.ChrRom.Length] = $value
+        }
+    }
+}
+
+class Mapper1 : Mapper {
+    [byte] $ShiftReg = 0x10
+    [byte] $Control = 0x0C
+    [byte] $ChrBank0 = 0
+    [byte] $ChrBank1 = 0
+    [byte] $PrgBank = 0
+
+    Mapper1([Rom] $rom) : base($rom) { }
+
+    [byte] CpuRead([ushort] $address) {
+        if ($address -lt 0x8000 -or -not $this.Rom.IsValid -or $null -eq $this.Rom.PrgRom -or $this.Rom.PrgRom.Length -eq 0) { return 0 }
+        [int] $prgLen = $this.Rom.PrgRom.Length
+        [int] $bankCount = [Math]::Max(1, [int]($prgLen / 16384))
+        [int] $mode = ($this.Control -shr 2) -band 0x03
+        [int] $offset = 0
+        if ($mode -eq 0 -or $mode -eq 1) {
+            [int] $bank32 = ($this.PrgBank -band 0x0E) % [Math]::Max(1, [int]($prgLen / 32768))
+            $offset = ($bank32 * 32768) + ($address - 0x8000)
+        } elseif ($mode -eq 2) {
+            if ($address -lt 0xC000) {
+                $offset = $address - 0x8000
+            } else {
+                [int] $bank = ($this.PrgBank -band 0x0F) % $bankCount
+                $offset = ($bank * 16384) + ($address - 0xC000)
+            }
+        } else {
+            if ($address -lt 0xC000) {
+                [int] $bank = ($this.PrgBank -band 0x0F) % $bankCount
+                $offset = ($bank * 16384) + ($address - 0x8000)
+            } else {
+                $offset = (($bankCount - 1) * 16384) + ($address - 0xC000)
+            }
+        }
+        return $this.Rom.PrgRom[$offset % $prgLen]
+    }
+
+    [void] CpuWrite([ushort] $address, [byte] $value) {
+        if ($address -lt 0x8000) { return }
+        if (($value -band 0x80) -ne 0) {
+            $this.ShiftReg = 0x10
+            $this.Control = [byte]($this.Control -bor 0x0C)
+            return
+        }
+        [bool] $complete = ($this.ShiftReg -band 0x01) -ne 0
+        $this.ShiftReg = [byte](($this.ShiftReg -shr 1) -bor (($value -band 0x01) -shl 4))
+        if ($complete) {
+            [byte] $regVal = $this.ShiftReg
+            if ($address -lt 0xA000) {
+                $this.Control = $regVal
+            } elseif ($address -lt 0xC000) {
+                $this.ChrBank0 = $regVal
+            } elseif ($address -lt 0xE000) {
+                $this.ChrBank1 = $regVal
+            } else {
+                $this.PrgBank = $regVal
+            }
+            $this.ShiftReg = 0x10
+        }
+    }
+
+    [byte] PpuRead([ushort] $address) {
+        if ($null -eq $this.Rom.ChrRom -or $this.Rom.ChrRom.Length -eq 0) { return 0 }
+        [int] $chrLen = $this.Rom.ChrRom.Length
+        [int] $offset = 0
+        if (($this.Control -band 0x10) -eq 0) {
+            [int] $bank = $this.ChrBank0 -band 0x1E
+            $offset = ($bank * 4096) + ($address -band 0x1FFF)
+        } else {
+            if ($address -lt 0x1000) {
+                $offset = ($this.ChrBank0 * 4096) + ($address -band 0x0FFF)
+            } else {
+                $offset = ($this.ChrBank1 * 4096) + ($address -band 0x0FFF)
+            }
+        }
+        return $this.Rom.ChrRom[$offset % $chrLen]
+    }
+
+    [void] PpuWrite([ushort] $address, [byte] $value) {
+        if (-not $this.Rom.ChrRam -or $null -eq $this.Rom.ChrRom -or $this.Rom.ChrRom.Length -eq 0) { return }
+        [int] $chrLen = $this.Rom.ChrRom.Length
+        [int] $offset = 0
+        if (($this.Control -band 0x10) -eq 0) {
+            [int] $bank = $this.ChrBank0 -band 0x1E
+            $offset = ($bank * 4096) + ($address -band 0x1FFF)
+        } else {
+            if ($address -lt 0x1000) {
+                $offset = ($this.ChrBank0 * 4096) + ($address -band 0x0FFF)
+            } else {
+                $offset = ($this.ChrBank1 * 4096) + ($address -band 0x0FFF)
+            }
+        }
+        $this.Rom.ChrRom[$offset % $chrLen] = $value
+    }
+
+    [Mirroring] GetMirroring() {
+        [int] $m = $this.Control -band 0x03
+        if ($m -eq 0) { return [Mirroring]::SingleScreen }
+        if ($m -eq 1) { return [Mirroring]::SingleScreenUpper }
+        if ($m -eq 2) { return [Mirroring]::Vertical }
+        return [Mirroring]::Horizontal
+    }
+}
+
+class Mapper2 : Mapper {
+    [int] $PrgBank = 0
+
+    Mapper2([Rom] $rom) : base($rom) { }
+
+    [byte] CpuRead([ushort] $address) {
+        if ($address -lt 0x8000 -or -not $this.Rom.IsValid -or $null -eq $this.Rom.PrgRom -or $this.Rom.PrgRom.Length -eq 0) { return 0 }
+        [int] $prgLen = $this.Rom.PrgRom.Length
+        [int] $bankCount = [Math]::Max(1, [int]($prgLen / 16384))
+        [int] $offset = 0
+        if ($address -lt 0xC000) {
+            [int] $bank = $this.PrgBank % $bankCount
+            $offset = ($bank * 16384) + ($address - 0x8000)
+        } else {
+            $offset = (($bankCount - 1) * 16384) + ($address - 0xC000)
+        }
+        return $this.Rom.PrgRom[$offset % $prgLen]
+    }
+
+    [void] CpuWrite([ushort] $address, [byte] $value) {
+        if ($address -ge 0x8000) {
+            $this.PrgBank = $value -band 0x0F
+        }
+    }
+
+    [byte] PpuRead([ushort] $address) {
+        if ($null -ne $this.Rom.ChrRom -and $this.Rom.ChrRom.Length -gt 0) {
+            return $this.Rom.ChrRom[$address % $this.Rom.ChrRom.Length]
+        }
+        return 0
+    }
+
+    [void] PpuWrite([ushort] $address, [byte] $value) {
+        if ($this.Rom.ChrRam -and $null -ne $this.Rom.ChrRom -and $this.Rom.ChrRom.Length -gt 0) {
+            $this.Rom.ChrRom[$address % $this.Rom.ChrRom.Length] = $value
+        }
+    }
+}
+
+class Mapper3 : Mapper {
+    [int] $ChrBank = 0
+
+    Mapper3([Rom] $rom) : base($rom) { }
+
+    [byte] CpuRead([ushort] $address) {
+        if ($address -ge 0x8000 -and $this.Rom.IsValid -and $null -ne $this.Rom.PrgRom -and $this.Rom.PrgRom.Length -gt 0) {
+            [int] $prgAddr = $address - 0x8000
+            if ($this.Rom.PrgRom.Length -eq 16384) {
+                $prgAddr = $prgAddr % 16384
+            } else {
+                $prgAddr = $prgAddr % $this.Rom.PrgRom.Length
+            }
+            return $this.Rom.PrgRom[$prgAddr]
+        }
+        return 0
+    }
+
+    [void] CpuWrite([ushort] $address, [byte] $value) {
+        if ($address -ge 0x8000) {
+            $this.ChrBank = $value -band 0x03
+        }
+    }
+
+    [byte] PpuRead([ushort] $address) {
+        if ($null -ne $this.Rom.ChrRom -and $this.Rom.ChrRom.Length -gt 0) {
+            [int] $offset = ($this.ChrBank * 8192) + ($address -band 0x1FFF)
+            return $this.Rom.ChrRom[$offset % $this.Rom.ChrRom.Length]
+        }
+        return 0
+    }
+}
+
+class Mapper7 : Mapper {
+    [int] $PrgBank = 0
+    [Mirroring] $MirrorMode = [Mirroring]::SingleScreen
+
+    Mapper7([Rom] $rom) : base($rom) { }
+
+    [byte] CpuRead([ushort] $address) {
+        if ($address -ge 0x8000 -and $this.Rom.IsValid -and $null -ne $this.Rom.PrgRom -and $this.Rom.PrgRom.Length -gt 0) {
+            [int] $prgLen = $this.Rom.PrgRom.Length
+            [int] $bankCount = [Math]::Max(1, [int]($prgLen / 32768))
+            [int] $bank = $this.PrgBank % $bankCount
+            [int] $offset = ($bank * 32768) + ($address - 0x8000)
+            return $this.Rom.PrgRom[$offset % $prgLen]
+        }
+        return 0
+    }
+
+    [void] CpuWrite([ushort] $address, [byte] $value) {
+        if ($address -ge 0x8000) {
+            $this.PrgBank = $value -band 0x07
+            $this.MirrorMode = (($value -band 0x10) -ne 0) ? [Mirroring]::SingleScreenUpper : [Mirroring]::SingleScreen
+        }
+    }
+
+    [byte] PpuRead([ushort] $address) {
+        if ($null -ne $this.Rom.ChrRom -and $this.Rom.ChrRom.Length -gt 0) {
+            return $this.Rom.ChrRom[$address % $this.Rom.ChrRom.Length]
+        }
+        return 0
+    }
+
+    [void] PpuWrite([ushort] $address, [byte] $value) {
+        if ($this.Rom.ChrRam -and $null -ne $this.Rom.ChrRom -and $this.Rom.ChrRom.Length -gt 0) {
+            $this.Rom.ChrRom[$address % $this.Rom.ChrRom.Length] = $value
+        }
+    }
+
+    [Mirroring] GetMirroring() {
+        return $this.MirrorMode
+    }
 }
 
 class Rom {
@@ -25,9 +287,21 @@ class Rom {
     [Mirroring] $Mirroring
     [bool] $IsValid
     [bool] $HasBatteryBackedRam
+    [Mapper] $MapperImpl
 
     Rom() {
         $this.IsValid = $false
+    }
+
+    [Mapper] EnsureMapper() {
+        if ($null -eq $this.MapperImpl) {
+            if ($this.Mapper -eq 1) { $this.MapperImpl = [Mapper1]::new($this) }
+            elseif ($this.Mapper -eq 2) { $this.MapperImpl = [Mapper2]::new($this) }
+            elseif ($this.Mapper -eq 3) { $this.MapperImpl = [Mapper3]::new($this) }
+            elseif ($this.Mapper -eq 7) { $this.MapperImpl = [Mapper7]::new($this) }
+            else { $this.MapperImpl = [Mapper0]::new($this) }
+        }
+        return $this.MapperImpl
     }
 
     [bool] Load([string] $filePath) {
@@ -51,11 +325,10 @@ class Rom {
         [byte] $control1 = $data[6]
         [byte] $control2 = $data[7]
         if ($prgBanks -eq 0) { return $false }
-        # This core implements NROM only. Reject NES 2.0 and nonzero
-        # mappers instead of executing them through fixed NROM mapping.
+        # Reject NES 2.0 and unsupported mappers.
         if (($control2 -band 0x0C) -eq 0x08) { return $false }
         [int] $mapperNumber = (($control2 -band 0xF0) -bor (($control1 -shr 4) -band 0x0F))
-        if ($mapperNumber -ne 0) { return $false }
+        if ($mapperNumber -ne 0 -and $mapperNumber -ne 1 -and $mapperNumber -ne 2 -and $mapperNumber -ne 3 -and $mapperNumber -ne 7) { return $false }
 
         $this.HasBatteryBackedRam = ($control1 -band 0x02) -ne 0
 
@@ -90,7 +363,9 @@ class Rom {
             $this.ChrRam = $true
         }
 
+        $this.MapperImpl = $null
         $this.IsValid = $true
+        [void]$this.EnsureMapper()
         return $true
     }
 }
@@ -212,24 +487,23 @@ class Ppu {
         }
     }
 
+    [int] ResolveNametable([int] $nt) {
+        [Mirroring] $m = $this.Rom.EnsureMapper().GetMirroring()
+        if ($m -eq [Mirroring]::Vertical) { return $nt -band 1 }
+        if ($m -eq [Mirroring]::Horizontal) { return $nt -shr 1 }
+        if ($m -eq [Mirroring]::SingleScreen) { return 0 }
+        if ($m -eq [Mirroring]::SingleScreenUpper) { return 1 }
+        return $nt
+    }
+
     [byte] ReadVram([ushort] $addr) {
         $addr = $addr % 0x4000
         if ($addr -lt 0x2000) {
-            if ($null -ne $this.Rom.ChrRom -and $this.Rom.ChrRom.Length -gt 0) {
-                return $this.Rom.ChrRom[$addr % $this.Rom.ChrRom.Length]
-            }
-            return 0
+            return $this.Rom.EnsureMapper().PpuRead($addr)
         } elseif ($addr -lt 0x3F00) {
             [int] $nt = ($addr -band 0x0FFF) -shr 10
             [int] $inner = $addr -band 0x03FF
-            [int] $table = $nt
-            if ($this.Rom.Mirroring -eq [Mirroring]::Vertical) {
-                $table = $nt -band 1
-            } elseif ($this.Rom.Mirroring -eq [Mirroring]::Horizontal) {
-                $table = $nt -shr 1
-            } elseif ($this.Rom.Mirroring -eq [Mirroring]::SingleScreen) {
-                $table = 0
-            }
+            [int] $table = $this.ResolveNametable($nt)
             return $this.Vram[($table * 1024 + $inner) % $this.Vram.Length]
         } else {
             [int] $paletteAddress = $addr -band 0x1F
@@ -241,20 +515,11 @@ class Ppu {
     [void] WriteVram([ushort] $addr, [byte] $val) {
         $addr = $addr % 0x4000
         if ($addr -lt 0x2000) {
-            if ($this.Rom.ChrRam) {
-                $this.Rom.ChrRom[$addr % $this.Rom.ChrRom.Length] = $val
-            }
+            $this.Rom.EnsureMapper().PpuWrite($addr, $val)
         } elseif ($addr -lt 0x3F00) {
             [int] $nt = ($addr -band 0x0FFF) -shr 10
             [int] $inner = $addr -band 0x03FF
-            [int] $table = $nt
-            if ($this.Rom.Mirroring -eq [Mirroring]::Vertical) {
-                $table = $nt -band 1
-            } elseif ($this.Rom.Mirroring -eq [Mirroring]::Horizontal) {
-                $table = $nt -shr 1
-            } elseif ($this.Rom.Mirroring -eq [Mirroring]::SingleScreen) {
-                $table = 0
-            }
+            [int] $table = $this.ResolveNametable($nt)
             $this.Vram[($table * 1024 + $inner) % $this.Vram.Length] = $val
         } else {
             [int] $paletteAddress = $addr -band 0x1F
@@ -283,8 +548,8 @@ class Ppu {
         $cachedbgOpaque = $this.BgOpaque
         $cachedoam = $this.Oam
         $cachedrom = $this.Rom
-        $mirroring = $cachedrom.Mirroring
-        $chrRom = $cachedrom.ChrRom
+        [Mapper] $mapper = $cachedrom.EnsureMapper()
+        $mirroring = $mapper.GetMirroring()
         # Mapper 0 tile-span renderer. Background work is aligned to source
         # tile spans, so a non-byte-aligned scroll only clips the first/last
         # span; each tile row is fetched once and emitted to the framebuffer.
@@ -293,7 +558,6 @@ class Ppu {
         [int] $bgPattern = (($cachedctrl -band 0x10) -ne 0) ? 0x1000 : 0
         [int] $sprPattern = (($cachedctrl -band 0x08) -ne 0) ? 0x1000 : 0
         [int] $baseNt = $cachedctrl -band 0x03
-        [int] $chrLength = if ($null -ne $chrRom) { $chrRom.Length } else { 0 }
         [int] $vramLength = $cachedvram.Length
 
         for ([int] $y = 0; $y -lt 240; $y++) {
@@ -336,8 +600,8 @@ class Ppu {
                 [int] $quadrant = ((($tileY -band 2) -shr 1) -shl 1) -bor (($localTileX -band 2) -shr 1)
                 [int] $paletteNo = ($attr -shr ($quadrant * 2)) -band 3
                 [int] $plane = $bgPattern + ($tile * 16) + $fineY
-                [int] $lo = if ($chrLength -gt 0) { $chrRom[$plane % $chrLength] } else { 0 }
-                [int] $hi = if ($chrLength -gt 0) { $chrRom[($plane + 8) % $chrLength] } else { 0 }
+                [int] $lo = $mapper.PpuRead([ushort]$plane)
+                [int] $hi = $mapper.PpuRead([ushort]($plane + 8))
 
                 for ([int] $x = $emitStart; $x -le $emitEnd; $x++) {
                     [int] $sourceCol = $x - $destStart
@@ -376,8 +640,8 @@ class Ppu {
                         $tileIndex = ($tile -band 0xFE) + ($sourceRow -shr 3)
                     }
                     [int] $plane = $patternBase + ($tileIndex * 16) + ($sourceRow -band 7)
-                    [int] $lo = if ($chrLength -gt 0) { $chrRom[$plane % $chrLength] } else { 0 }
-                    [int] $hi = if ($chrLength -gt 0) { $chrRom[($plane + 8) % $chrLength] } else { 0 }
+                    [int] $lo = $mapper.PpuRead([ushort]$plane)
+                    [int] $hi = $mapper.PpuRead([ushort]($plane + 8))
                     for ([int] $col = 0; $col -lt 8; $col++) {
                         [int] $dx = $sx + $col
                         if ($dx -lt 0 -or $dx -ge 256) { continue }
@@ -480,13 +744,7 @@ class Memory {
         } elseif ($address -ge 0x6000 -and $address -lt 0x8000) {
             return $this.Sram[$address - 0x6000]
         } elseif ($address -ge 0x8000) {
-            if ($this.Rom.IsValid -and $null -ne $this.Rom.PrgRom -and $this.Rom.PrgRom.Length -gt 0) {
-                [int] $prgAddr = $address - 0x8000
-                if ($this.Rom.PrgRom.Length -eq 16384) {
-                    $prgAddr = $prgAddr % 16384
-                }
-                return $this.Rom.PrgRom[$prgAddr]
-            }
+            return $this.Rom.EnsureMapper().CpuRead($address)
         }
         return 0
     }
@@ -520,6 +778,8 @@ class Memory {
             }
         } elseif ($address -ge 0x6000 -and $address -lt 0x8000) {
             $this.Sram[$address - 0x6000] = $value
+        } elseif ($address -ge 0x8000) {
+            $this.Rom.EnsureMapper().CpuWrite($address, $value)
         }
     }
     
@@ -3129,9 +3389,43 @@ Case 'sprite Y FF and clipping boundaries' {
     $r=New-Rig; $r.Ppu.Mask=0x14; $r.Ppu.Oam[0]=0xff; $r.Ppu.Oam[1]=0; $r.Ppu.Oam[2]=0; $r.Ppu.Oam[3]=255; $r.Ppu.RenderFrame()
     Assert-Equal 61440 $r.Ppu.Pixels.Length 'sprite edge frame remains complete'
 }
-Case 'mapper one image does not become valid mapper zero' {
-    $path=Join-Path ([IO.Path]::GetTempPath()) "psnes-mapper-$([guid]::NewGuid()).nes"; $d=[byte[]]::new(16+16384); $d[0]=0x4e;$d[1]=0x45;$d[2]=0x53;$d[3]=0x1a;$d[4]=1;$d[6]=0x10;[IO.File]::WriteAllBytes($path,$d)
+Case 'unsupported mapper image is rejected' {
+    $path=Join-Path ([IO.Path]::GetTempPath()) "psnes-mapper-$([guid]::NewGuid()).nes"; $d=[byte[]]::new(16+16384); $d[0]=0x4e;$d[1]=0x45;$d[2]=0x53;$d[3]=0x1a;$d[4]=1;$d[6]=0x30;$d[7]=0x60;[IO.File]::WriteAllBytes($path,$d)
     try { $rom=[Rom]::new(); Assert-Equal $false $rom.Load($path) 'unsupported mapper rejection' } finally { Remove-Item $path -Force -ErrorAction SilentlyContinue }
+}
+Case 'MMC1 mapper 1 PRG banking and mirroring' {
+    $r=New-Rig; $r.Rom.Mapper=1; $r.Rom.MapperImpl=$null
+    $r.Rom.PrgRom=[byte[]]::new(65536); $r.Rom.PrgRom[0]=0x11; $r.Rom.PrgRom[16384]=0x22; $r.Rom.PrgRom[49152]=0x44
+    Assert-Equal 0x44 $r.Mem.Read(0xC000) 'MMC1 fixed last bank'
+    # Write 1 to $E000-$FFFF (5 serial writes) to select PRG bank 1 at $8000
+    foreach ($b in @(1,0,0,0,0)) { $r.Mem.Write(0xE000, [byte]$b) }
+    Assert-Equal 0x22 $r.Mem.Read(0x8000) 'MMC1 switched PRG bank 1'
+    # Write 2 to $8000-$9FFF to select Vertical mirroring
+    foreach ($b in @(0,1,0,0,0)) { $r.Mem.Write(0x8000, [byte]$b) }
+    Assert-Equal ([Mirroring]::Vertical) $r.Rom.EnsureMapper().GetMirroring() 'MMC1 vertical mirroring'
+}
+Case 'UxROM mapper 2 PRG banking' {
+    $r=New-Rig; $r.Rom.Mapper=2; $r.Rom.MapperImpl=$null
+    $r.Rom.PrgRom=[byte[]]::new(32768); $r.Rom.PrgRom[0]=0xAA; $r.Rom.PrgRom[16384]=0xBB
+    Assert-Equal 0xAA $r.Mem.Read(0x8000) 'UxROM initial bank 0'
+    Assert-Equal 0xBB $r.Mem.Read(0xC000) 'UxROM fixed last bank'
+    $r.Mem.Write(0x8000, 1)
+    Assert-Equal 0xBB $r.Mem.Read(0x8000) 'UxROM switched bank 1'
+}
+Case 'CNROM mapper 3 CHR banking' {
+    $r=New-Rig; $r.Rom.Mapper=3; $r.Rom.MapperImpl=$null
+    $r.Rom.ChrRom=[byte[]]::new(16384); $r.Rom.ChrRom[0]=0x12; $r.Rom.ChrRom[8192]=0x34
+    Assert-Equal 0x12 $r.Ppu.ReadVram(0x0000) 'CNROM bank 0'
+    $r.Mem.Write(0x8000, 1)
+    Assert-Equal 0x34 $r.Ppu.ReadVram(0x0000) 'CNROM bank 1'
+}
+Case 'AxROM mapper 7 PRG banking and single-screen mirroring' {
+    $r=New-Rig; $r.Rom.Mapper=7; $r.Rom.MapperImpl=$null
+    $r.Rom.PrgRom=[byte[]]::new(65536); $r.Rom.PrgRom[0]=0x55; $r.Rom.PrgRom[32768]=0x66
+    Assert-Equal 0x55 $r.Mem.Read(0x8000) 'AxROM bank 0'
+    $r.Mem.Write(0x8000, 0x11)
+    Assert-Equal 0x66 $r.Mem.Read(0x8000) 'AxROM bank 1'
+    Assert-Equal ([Mirroring]::SingleScreenUpper) $r.Rom.EnsureMapper().GetMirroring() 'AxROM upper nametable'
 }
 Case 'NES 2.0 image rejects unsupported format' {
     $path=Join-Path ([IO.Path]::GetTempPath()) "psnes-nes2-$([guid]::NewGuid()).nes"; $d=[byte[]]::new(16+16384); $d[0]=0x4e;$d[1]=0x45;$d[2]=0x53;$d[3]=0x1a;$d[4]=1;$d[7]=8;[IO.File]::WriteAllBytes($path,$d)
