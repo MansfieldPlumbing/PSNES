@@ -653,15 +653,18 @@ class Ppu {
     # Scanline on which sprite 0 overlaps opaque background this frame, or -1.
     [int] $Sprite0Line = -1
     # Scroll and control in force on each visible row, captured as the CPU runs.
-    [int[]] $LineX = [int[]]::new(240)
-    [int[]] $LineY = [int[]]::new(240)
-    [int[]] $LineCtrl = [int[]]::new(240)
     [int[]] $SprY = [int[]]::new(8)
     [int[]] $SprTile = [int[]]::new(8)
     [int[]] $SprAttr = [int[]]::new(8)
     [int[]] $SprX = [int[]]::new(8)
+    [int[]] $SprLo = [int[]]::new(8)
+    [int[]] $SprHi = [int[]]::new(8)
     [bool[]] $SprIs0 = [bool[]]::new(8)
     [int] $SprCount = 0
+    [int] $BgTileLo = 0
+    [int] $BgTileHi = 0
+    [int] $BgTilePal = 0
+    [int] $BgCachedTile = -1
 
     Ppu([Rom] $rom) {
         # The PPU is constructed before the ROM is loaded, so allocate the
@@ -799,145 +802,38 @@ class Ppu {
     [bool] $FrameEnded
     [Cpu6502] $Cpu
 
-    [void] RenderFrame() {
-        # RenderFrame runs after the CPU's frame, so it cannot set the sprite-0 flag itself:
-        # it records the hit's scanline, and AdvanceDots sets the flag when the CPU reaches it.
-        $this.Sprite0Line = -1
-        # Cache hot PPU fields locally. PowerShell property dispatch inside
-        # the 61,440-pixel loop is substantially more expensive than array access.
-        [int] $cachedmask = $this.Mask
-        [int] $cachedctrl = $this.Ctrl
-        [int] $cachedscrollX = $this.ScrollX
-        [int] $cachedscrollY = $this.ScrollY
-        $cachedvram = $this.Vram
-        $cachedpalette = $this.Palette
-        $cachedpixels = $this.Pixels
-        $cachedbgOpaque = $this.BgOpaque
-        $cachedoam = $this.Oam
-        $cachedrom = $this.Rom
-        [Mapper] $mapper = $cachedrom.EnsureMapper()
-        $mirroring = $mapper.GetMirroring()
-        # Mapper 0 tile-span renderer. Background work is aligned to source
-        # tile spans, so a non-byte-aligned scroll only clips the first/last
-        # span; each tile row is fetched once and emitted to the framebuffer.
-        [bool] $bgEnabled = ($cachedmask -band 0x08) -ne 0
-        [bool] $sprEnabled = ($cachedmask -band 0x10) -ne 0
-        [int] $bgPattern = (($cachedctrl -band 0x10) -ne 0) ? 0x1000 : 0
-        [int] $sprPattern = (($cachedctrl -band 0x08) -ne 0) ? 0x1000 : 0
-        [int] $baseNt = $cachedctrl -band 0x03
-        [int] $vramLength = $cachedvram.Length
-
-        for ([int] $y = 0; $y -lt 240; $y++) {
-            # Mid-frame scroll: each row renders with the scroll and control in force on that row.
-            # Row-local: sprites below still use the frame's own Ctrl.
-            $cachedscrollX = $this.LineX[$y]
-            $cachedscrollY = $this.LineY[$y]
-            [int] $rowCtrl = $this.LineCtrl[$y]
-            $baseNt = $rowCtrl -band 0x03
-            $bgPattern = (($rowCtrl -band 0x10) -ne 0) ? 0x1000 : 0
-            [int] $worldY = $y + $cachedscrollY
-            [int] $ntY = ($worldY -shr 8) -band 1
-            [int] $localY = $worldY -band 0xFF
-            [int] $tileY = $localY -shr 3
-            [int] $fineY = $localY -band 7
-            [int] $worldTileFirst = $cachedscrollX -shr 3
-            [int] $worldTileLast = ($cachedscrollX + 255) -shr 3
-
-            for ([int] $worldTileX = $worldTileFirst; $worldTileX -le $worldTileLast; $worldTileX++) {
-                [int] $destStart = ($worldTileX * 8) - $cachedscrollX
-                [int] $destEnd = $destStart + 7
-                [int] $emitStart = if ($destStart -lt 0) { 0 } else { $destStart }
-                [int] $emitEnd = if ($destEnd -gt 255) { 255 } else { $destEnd }
-                if ($emitStart -gt $emitEnd) { continue }
-
-                [int] $localTileX = $worldTileX -band 31
-                [int] $ntX = ($worldTileX -shr 5) -band 1
-                [int] $nt = ($baseNt + $ntX + (2 * $ntY)) -band 3
-                [int] $ntTable = $this.ResolveNametable($nt)
-                [int] $ntBase = ($ntTable * 1024) % $vramLength
-                [int] $tile = $cachedvram[($ntBase + ($tileY * 32) + $localTileX) % $vramLength]
-                [int] $attr = $cachedvram[($ntBase + 0x3C0 + (($tileY -shr 2) * 8) + ($localTileX -shr 2)) % $vramLength]
-                [int] $quadrant = ((($tileY -band 2) -shr 1) -shl 1) -bor (($localTileX -band 2) -shr 1)
-                [int] $paletteNo = ($attr -shr ($quadrant * 2)) -band 3
-                [int] $plane = $bgPattern + ($tile * 16) + $fineY
-                [int] $lo = $mapper.PpuRead([ushort]$plane)
-                [int] $hi = $mapper.PpuRead([ushort]($plane + 8))
-
-                for ([int] $x = $emitStart; $x -le $emitEnd; $x++) {
-                    [int] $sourceCol = $x - $destStart
-                    [int] $bit = 7 - $sourceCol
-                    [int] $pixel = (($lo -shr $bit) -band 1) -bor ((($hi -shr $bit) -band 1) -shl 1)
-                    # A transparent background pixel shows the backdrop at $3F00, not its palette's own entry zero.
-                    [int] $color = $cachedpalette[($pixel -eq 0) ? 0 : (($paletteNo * 4) + $pixel)]
-                    [int] $frameIndex = ($y * 256) + $x
-                    $cachedbgOpaque[$frameIndex] = $bgEnabled -and $pixel -ne 0 -and ($x -ge 8 -or ($cachedmask -band 0x02) -ne 0)
-                    if (-not $bgEnabled -or ($x -lt 8 -and ($cachedmask -band 0x02) -eq 0)) {
-                        $color = $cachedpalette[0]
-                    }
-                    $cachedpixels[$frameIndex] = [byte]$color
-                }
-            }
-        }
-
-        if ($sprEnabled) {
-            [int] $height = (($cachedctrl -band 0x20) -ne 0) ? 16 : 8
-            for ([int] $n = 63; $n -ge 0; $n--) {
-                [int] $o = $n * 4
-                [int] $sy = $cachedoam[$o]
-                [int] $tile = $cachedoam[$o + 1]
-                [int] $attr = $cachedoam[$o + 2]
-                [int] $sx = $cachedoam[$o + 3]
-                for ([int] $row = 0; $row -lt $height; $row++) {
-                    [int] $dy = $sy + 1 + $row
-                    if ($dy -lt 0 -or $dy -ge 240) { continue }
-                    [int] $sourceRow = (($attr -band 0x80) -ne 0) ? ($height - 1 - $row) : $row
-                    [int] $patternBase = $sprPattern
-                    [int] $tileIndex = $tile
-                    if ($height -eq 16) {
-                        # In 8x16 mode PPUCTRL bit 3 is ignored. OAM tile bit 0
-                        # selects the pattern table; bits 1-7 select the pair.
-                        $patternBase = (($tile -band 1) -ne 0) ? 0x1000 : 0
-                        $tileIndex = ($tile -band 0xFE) + ($sourceRow -shr 3)
-                    }
-                    [int] $plane = $patternBase + ($tileIndex * 16) + ($sourceRow -band 7)
-                    [int] $lo = $mapper.PpuRead([ushort]$plane)
-                    [int] $hi = $mapper.PpuRead([ushort]($plane + 8))
-                    for ([int] $col = 0; $col -lt 8; $col++) {
-                        [int] $dx = $sx + $col
-                        if ($dx -lt 0 -or $dx -ge 256) { continue }
-                        [int] $sourceCol = (($attr -band 0x40) -ne 0) ? (7 - $col) : $col
-                        [int] $pixel = (($lo -shr (7 - $sourceCol)) -band 1) -bor ((($hi -shr (7 - $sourceCol)) -band 1) -shl 1)
-                        if ($pixel -eq 0 -or ($dx -lt 8 -and ($cachedmask -band 0x04) -eq 0)) { continue }
-                        [int] $idx = ($dy * 256) + $dx
-                        [bool] $pixelBgOpaque = $cachedbgOpaque[$idx]
-                        if ($n -eq 0 -and $pixelBgOpaque -and $dx -lt 255 -and
-                            ($dx -ge 8 -or (($cachedmask -band 0x04) -ne 0)) -and
-                            ($dx -ge 8 -or (($cachedmask -band 0x02) -ne 0))) {
-                            if ($this.Sprite0Line -lt 0 -or $dy -lt $this.Sprite0Line) { $this.Sprite0Line = $dy }
-                        }
-                        if (($attr -band 0x20) -ne 0 -and $pixelBgOpaque) { continue }
-                        $cachedpixels[$idx] = [byte]$cachedpalette[0x10 + (($attr -band 3) * 4) + $pixel]
-                    }
-                }
-            }
-        }
-    }
-
     [void] StartFrame() {
         $this.FrameEnded = $false
     }
 
     [void] EvaluateScanlineSprites([int] $y) {
         $this.SprCount = 0
+        $this.BgCachedTile = -1
         [int] $sprH = (($this.Ctrl -band 0x20) -ne 0) ? 16 : 8
+        [Mapper] $mapper = $this.Rom.EnsureMapper()
         for ([int] $i = 0; $i -lt 64; $i++) {
             [int] $sy = [int]$this.Oam[$i * 4] + 1
             if ($y -ge $sy -and $y -lt ($sy + $sprH)) {
                 if ($this.SprCount -lt 8) {
+                    [int] $tile = $this.Oam[$i * 4 + 1]
+                    [int] $attr = $this.Oam[$i * 4 + 2]
+                    [int] $row = $y - $sy
+                    if (($attr -band 0x80) -ne 0) { $row = ($sprH - 1) - $row }
+                    [int] $patBase = 0
+                    if ($sprH -eq 16) {
+                        $patBase = (($tile -band 1) -ne 0) ? 0x1000 : 0
+                        $tile = $tile -band 0xFE
+                        if ($row -ge 8) { $tile++; $row -= 8 }
+                    } else {
+                        $patBase = (($this.Ctrl -band 0x08) -ne 0) ? 0x1000 : 0
+                    }
+                    [int] $plane = $patBase + ($tile * 16) + $row
                     $this.SprY[$this.SprCount] = $sy
-                    $this.SprTile[$this.SprCount] = $this.Oam[$i * 4 + 1]
-                    $this.SprAttr[$this.SprCount] = $this.Oam[$i * 4 + 2]
+                    $this.SprTile[$this.SprCount] = $tile
+                    $this.SprAttr[$this.SprCount] = $attr
                     $this.SprX[$this.SprCount] = $this.Oam[$i * 4 + 3]
+                    $this.SprLo[$this.SprCount] = $mapper.PpuRead([ushort]$plane)
+                    $this.SprHi[$this.SprCount] = $mapper.PpuRead([ushort]($plane + 8))
                     $this.SprIs0[$this.SprCount] = ($i -eq 0)
                     $this.SprCount++
                 } else {
@@ -951,33 +847,37 @@ class Ppu {
     [void] RenderDot([int] $x, [int] $y) {
         [byte] $bgColor = 0
         [bool] $bgSolid = $false
-        [Mapper] $mapper = $this.Rom.EnsureMapper()
         if (($this.Mask -band 0x08) -ne 0 -and ($x -ge 8 -or ($this.Mask -band 0x02) -ne 0)) {
             [int] $fineXPos = ($x -band 7) + $this.FineX
-            [int] $v = $this.VramAddr
-            [int] $coarseX = ($v -band 0x1F) + ($fineXPos -shr 3)
-            [int] $nt = ($v -shr 10) -band 3
-            if ($coarseX -ge 32) {
-                $coarseX -= 32
-                $nt = $nt -bxor 1
+            [int] $tileStep = ($x -shr 3) + ($fineXPos -shr 3)
+            if ($tileStep -ne $this.BgCachedTile) {
+                [Mapper] $mapper = $this.Rom.EnsureMapper()
+                [int] $v = $this.VramAddr
+                [int] $coarseX = ($v -band 0x1F) + ($fineXPos -shr 3)
+                [int] $nt = ($v -shr 10) -band 3
+                if ($coarseX -ge 32) {
+                    $coarseX -= 32
+                    $nt = $nt -bxor 1
+                }
+                [int] $coarseY = ($v -shr 5) -band 0x1F
+                [int] $fineY = ($v -shr 12) -band 7
+                [int] $ntTable = $this.ResolveNametable($nt)
+                [int] $ntBase = ($ntTable * 1024) % $this.Vram.Length
+                [int] $tile = $this.Vram[($ntBase + ($coarseY * 32) + $coarseX) % $this.Vram.Length]
+                [int] $attr = $this.Vram[($ntBase + 0x3C0 + (($coarseY -shr 2) * 8) + ($coarseX -shr 2)) % $this.Vram.Length]
+                [int] $quadrant = ((($coarseY -band 2) -shr 1) -shl 1) -bor (($coarseX -band 2) -shr 1)
+                $this.BgTilePal = ($attr -shr ($quadrant * 2)) -band 3
+                [int] $bgPat = (($this.Ctrl -band 0x10) -ne 0) ? 0x1000 : 0
+                [int] $plane = $bgPat + ($tile * 16) + $fineY
+                $this.BgTileLo = $mapper.PpuRead([ushort]$plane)
+                $this.BgTileHi = $mapper.PpuRead([ushort]($plane + 8))
+                $this.BgCachedTile = $tileStep
             }
-            [int] $coarseY = ($v -shr 5) -band 0x1F
-            [int] $fineY = ($v -shr 12) -band 7
-            [int] $ntTable = $this.ResolveNametable($nt)
-            [int] $ntBase = ($ntTable * 1024) % $this.Vram.Length
-            [int] $tile = $this.Vram[($ntBase + ($coarseY * 32) + $coarseX) % $this.Vram.Length]
-            [int] $attr = $this.Vram[($ntBase + 0x3C0 + (($coarseY -shr 2) * 8) + ($coarseX -shr 2)) % $this.Vram.Length]
-            [int] $quadrant = ((($coarseY -band 2) -shr 1) -shl 1) -bor (($coarseX -band 2) -shr 1)
-            [int] $palNo = ($attr -shr ($quadrant * 2)) -band 3
-            [int] $bgPat = (($this.Ctrl -band 0x10) -ne 0) ? 0x1000 : 0
-            [int] $plane = $bgPat + ($tile * 16) + $fineY
-            [int] $lo = $mapper.PpuRead([ushort]$plane)
-            [int] $hi = $mapper.PpuRead([ushort]($plane + 8))
             [int] $bit = 7 - ($fineXPos -band 7)
-            [int] $px = (($lo -shr $bit) -band 1) -bor ((($hi -shr $bit) -band 1) -shl 1)
+            [int] $px = (($this.BgTileLo -shr $bit) -band 1) -bor ((($this.BgTileHi -shr $bit) -band 1) -shl 1)
             if ($px -ne 0) {
                 $bgSolid = $true
-                $bgColor = $this.Palette[($palNo * 4) + $px]
+                $bgColor = $this.Palette[($this.BgTilePal * 4) + $px]
             }
         }
 
@@ -986,29 +886,14 @@ class Ppu {
         [bool] $sprBehind = $false
         [bool] $sprZero = $false
         if (($this.Mask -band 0x10) -ne 0 -and ($x -ge 8 -or ($this.Mask -band 0x04) -ne 0)) {
-            [int] $sprH = (($this.Ctrl -band 0x20) -ne 0) ? 16 : 8
             for ([int] $s = 0; $s -lt $this.SprCount; $s++) {
                 [int] $sx = $this.SprX[$s]
                 if ($x -ge $sx -and $x -lt ($sx + 8)) {
-                    [int] $row = $y - $this.SprY[$s]
                     [int] $attr = $this.SprAttr[$s]
-                    if (($attr -band 0x80) -ne 0) { $row = ($sprH - 1) - $row }
                     [int] $col = $x - $sx
                     if (($attr -band 0x40) -ne 0) { $col = 7 - $col }
-                    [int] $tile = $this.SprTile[$s]
-                    [int] $patBase = 0
-                    if ($sprH -eq 16) {
-                        $patBase = (($tile -band 1) -ne 0) ? 0x1000 : 0
-                        $tile = $tile -band 0xFE
-                        if ($row -ge 8) { $tile++; $row -= 8 }
-                    } else {
-                        $patBase = (($this.Ctrl -band 0x08) -ne 0) ? 0x1000 : 0
-                    }
-                    [int] $plane = $patBase + ($tile * 16) + $row
-                    [int] $lo = $mapper.PpuRead([ushort]$plane)
-                    [int] $hi = $mapper.PpuRead([ushort]($plane + 8))
                     [int] $bit = 7 - $col
-                    [int] $px = (($lo -shr $bit) -band 1) -bor ((($hi -shr $bit) -band 1) -shl 1)
+                    [int] $px = (($this.SprLo[$s] -shr $bit) -band 1) -bor ((($this.SprHi[$s] -shr $bit) -band 1) -shl 1)
                     if ($px -ne 0) {
                         $sprOpaque = $true
                         $sprColor = $this.Palette[0x10 + (($attr -band 3) * 4) + $px]
@@ -3194,6 +3079,7 @@ class PsnesBench {
         for ([int] $frame = 0; $frame -lt $frames; $frame++) { $nes.RunFrame() }
         $clock.Stop()
         [Console]::WriteLine('{0} frames in {1} ms; RAM checksum {2:X16}', $frames, $clock.ElapsedMilliseconds, [PsnesBench]::Checksum($nes.Memory.Ram))
+        [Console]::WriteLine('FB checksum {0:X16}', [PsnesBench]::Checksum($nes.Ppu.Pixels))
         return 0
     }
 
@@ -3786,8 +3672,11 @@ Case 'PPU address latch and 32-byte increment' {
     Assert-Equal 0x2020 $r.Ppu.VramAddr 'PPUDATA increment 32'; Assert-Equal 0x5a $r.Ppu.ReadVram(0x2000) 'PPU address latch'
 }
 Case 'scroll seam base nametables and vertical wrap' {
-    $r=New-Rig; $r.Ppu.Ctrl=3; $r.Ppu.Mask=8; $r.Ppu.ScrollX=255; $r.Ppu.ScrollY=255; $r.Ppu.Scanline=0; $r.Ppu.Cycle=0; $r.Ppu.AdvanceDots(262*341)
-    Assert-Equal 61440 $r.Ppu.Pixels.Length 'complete framebuffer at seam'
+    $r=New-Rig; $r.Ppu.Ctrl=3; $r.Ppu.Mask=0x0A; $r.Ppu.Palette[0]=0x0F; $r.Ppu.Palette[1]=0x30
+    $r.Ppu.WriteVram(0x0010, 0x80); $r.Ppu.WriteVram(0x0018, 0x00) # tile 1
+    $r.Ppu.WriteVram(0x2C00, 1) # nametable 3 top-left tile
+    $r.Ppu.VramAddr=0x0C00; $r.Ppu.Scanline=0; $r.Ppu.Cycle=0; $r.Ppu.AdvanceDots(341)
+    Assert-Equal 0x30 $r.Ppu.Pixels[0] 'nametable 3 pixel rendered'
 }
 Case '8x16 ignores PPUCTRL sprite table bit' {
     $r=New-Rig; $r.Ppu.WriteVram(0x0000,0x80); $r.Ppu.WriteVram(0x1000,0x00)
@@ -3811,8 +3700,10 @@ Case 'sprite zero hit is visible through PPUSTATUS' {
 # Sprite overflow/evaluation is intentionally unsupported. It remains documented
 # in the audit rather than being a required green-gate assertion.
 Case 'sprite Y FF and clipping boundaries' {
-    $r=New-Rig; $r.Ppu.Mask=0x14; $r.Ppu.Oam[0]=0xff; $r.Ppu.Oam[1]=0; $r.Ppu.Oam[2]=0; $r.Ppu.Oam[3]=255; $r.Ppu.Scanline=0; $r.Ppu.Cycle=0; $r.Ppu.AdvanceDots(262*341)
-    Assert-Equal 61440 $r.Ppu.Pixels.Length 'sprite edge frame remains complete'
+    $r=New-Rig; $r.Ppu.Mask=0x14; $r.Ppu.Palette[0]=0x0D; $r.Ppu.Palette[0x11]=0x21
+    $r.Ppu.WriteVram(0x0000, 0x80); $r.Ppu.Oam[0]=0xff; $r.Ppu.Oam[1]=0; $r.Ppu.Oam[2]=0; $r.Ppu.Oam[3]=255
+    $r.Ppu.Scanline=0; $r.Ppu.Cycle=0; $r.Ppu.AdvanceDots(341)
+    Assert-Equal 0x0D $r.Ppu.Pixels[255] 'sprite Y=FF is offscreen at row 0'
 }
 Case 'unsupported mapper image is rejected' {
     $path=Join-Path ([IO.Path]::GetTempPath()) "psnes-mapper-$([guid]::NewGuid()).nes"; $d=[byte[]]::new(16+16384); $d[0]=0x4e;$d[1]=0x45;$d[2]=0x53;$d[3]=0x1a;$d[4]=1;$d[6]=0x30;$d[7]=0x60;[IO.File]::WriteAllBytes($path,$d)
