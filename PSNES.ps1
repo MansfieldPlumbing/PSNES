@@ -1050,7 +1050,9 @@ class Ppu {
                     }
                 }
             } elseif ($this.Scanline -lt 240 -and $this.Cycle -ge 1 -and $this.Cycle -le 256) {
-                $this.Pixels[$this.Scanline * 256 + ($this.Cycle - 1)] = $this.Palette[0]
+                [int] $pxOff = $this.Scanline * 256 + ($this.Cycle - 1)
+                $this.Pixels[$pxOff] = $this.Palette[0]
+                if ($this.RecordPixelSource) { $this.PixelSource[$pxOff] = 0 }
             }
             if ($this.Cycle -ge 341) {
                 $this.Cycle = 0
@@ -3170,6 +3172,7 @@ class MachineSnapshot {
     [int] $BgNextHi
     [bool] $BgPrefetched
     [int] $MapperId
+    [ulong] $RomHash
     [int[]] $MapperInts
     [long] $MapperLong
     [bool] $MapperBool
@@ -3370,6 +3373,7 @@ class Nes {
         $s.BgNextHi = $this.Ppu.BgNextHi
         $s.BgPrefetched = $this.Ppu.BgPrefetched
         $s.MapperId = $this.Rom.Mapper
+        $s.RomHash = [PsnesBench]::Checksum($this.Rom.PrgRom)
         [Mapper] $m = $this.Rom.EnsureMapper()
         if ($m -is [Mapper1]) {
             [Mapper1] $m1 = [Mapper1]$m
@@ -3405,6 +3409,10 @@ class Nes {
     [void] RestoreSnapshot([MachineSnapshot] $s) {
         if ($s.MapperId -ne $this.Rom.Mapper) {
             throw "Snapshot mapper $($s.MapperId) is incompatible with ROM mapper $($this.Rom.Mapper)."
+        }
+        [ulong] $curHash = [PsnesBench]::Checksum($this.Rom.PrgRom)
+        if ($s.RomHash -ne $curHash) {
+            throw "Snapshot ROM identity mismatch."
         }
         [Array]::Copy($s.Ram, $this.Memory.Ram, $this.Memory.Ram.Length)
         if ($this.Memory.Sram.Length -gt 0 -and $s.Sram.Length -eq $this.Memory.Sram.Length) {
@@ -4371,6 +4379,31 @@ Case 'MMC3 snapshot restore and PixelSource observation' {
     Assert-Equal 2 $b1m4.Regs[6] 'MMC3 Regs[6] restored'
     $obs = $n.CaptureObservation(1)
     Assert-Equal 61440 $obs.PixelSource.Length 'PixelSource populated when enabled'
+}
+Case 'PixelSource exact provenance and snapshot RomHash rejection' {
+    $r = New-Rig
+    $r.Ppu.RecordPixelSource = $true
+    $r.Ppu.Palette[0] = 0x0F; $r.Ppu.Palette[1] = 0x11; $r.Ppu.Palette[0x11] = 0x22
+    $r.Ppu.WriteVram(0x2000, 1)
+    $r.Rom.ChrRom[16] = 0x80
+    $r.Rom.ChrRom[32] = 0x80
+    $r.Ppu.Oam[0] = 0; $r.Ppu.Oam[1] = 2; $r.Ppu.Oam[2] = 0; $r.Ppu.Oam[3] = 0
+    $r.Ppu.Mask = 0x1E
+    $r.Ppu.EvaluateScanlineSprites(0)
+    $r.Ppu.AdvanceDots(2 * 341)
+    Assert-Equal (0x10000000 -bor 0x11) $r.Ppu.PixelSource[0] 'BG tile provenance at (0,0)'
+    Assert-Equal (0x20000000 -bor 0x22) $r.Ppu.PixelSource[256] 'Sprite OAM 0 provenance at (0,1)'
+    $r.Ppu.Mask = 0x00
+    $r.Ppu.Scanline = 0; $r.Ppu.Cycle = 0; $r.Ppu.AdvanceDots(341)
+    Assert-Equal 0 $r.Ppu.PixelSource[0] 'PixelSource cleared when rendering disabled'
+    $n2 = [Nes]::new()
+    $n2.Rom.PrgRom = [byte[]]::new(32768); $n2.Rom.ChrRom = [byte[]]::new(8192); $n2.Rom.IsValid = $true
+    $n2.PowerOn()
+    $badSnap = $n2.CaptureSnapshot()
+    $badSnap.RomHash = 12345UL
+    [bool] $threw = $false
+    try { $n2.RestoreSnapshot($badSnap) } catch { $threw = $true }
+    Assert-Equal $true $threw 'RestoreSnapshot rejects mismatched RomHash'
 }
 $results | Format-Table -AutoSize
 if (@($results | Where-Object Result -eq 'FAIL').Count -gt 0) { exit 1 }
