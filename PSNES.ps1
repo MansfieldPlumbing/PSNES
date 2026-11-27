@@ -183,13 +183,13 @@ class Mapper1 : Mapper {
     }
 
     [byte] SramRead([ushort] $address, [byte[]] $sram) {
-        if (($this.PrgBank -band 0x10) -ne 0) { return 0 }
-        return $sram[$address - 0x6000]
+        if (($this.PrgBank -band 0x10) -ne 0 -or $sram.Length -eq 0) { return 0 }
+        return $sram[($address - 0x6000) % $sram.Length]
     }
 
     [void] SramWrite([ushort] $address, [byte] $value, [byte[]] $sram) {
-        if (($this.PrgBank -band 0x10) -ne 0) { return }
-        $sram[$address - 0x6000] = $value
+        if (($this.PrgBank -band 0x10) -ne 0 -or $sram.Length -eq 0) { return }
+        $sram[($address - 0x6000) % $sram.Length] = $value
     }
 
     [Mirroring] GetMirroring() {
@@ -355,13 +355,13 @@ class Mapper4 : Mapper {
     }
 
     [byte] SramRead([ushort] $address, [byte[]] $sram) {
-        if (-not $this.PrgRamEnabled) { return 0 }
-        return $sram[$address - 0x6000]
+        if (-not $this.PrgRamEnabled -or $sram.Length -eq 0) { return 0 }
+        return $sram[($address - 0x6000) % $sram.Length]
     }
 
     [void] SramWrite([ushort] $address, [byte] $value, [byte[]] $sram) {
-        if (-not $this.PrgRamEnabled -or $this.PrgRamWriteProtect) { return }
-        $sram[$address - 0x6000] = $value
+        if (-not $this.PrgRamEnabled -or $this.PrgRamWriteProtect -or $sram.Length -eq 0) { return }
+        $sram[($address - 0x6000) % $sram.Length] = $value
     }
 
     [int] ResolveChrOffset([ushort] $address) {
@@ -3786,13 +3786,13 @@ Case 'PPU address latch and 32-byte increment' {
     Assert-Equal 0x2020 $r.Ppu.VramAddr 'PPUDATA increment 32'; Assert-Equal 0x5a $r.Ppu.ReadVram(0x2000) 'PPU address latch'
 }
 Case 'scroll seam base nametables and vertical wrap' {
-    $r=New-Rig; $r.Ppu.Ctrl=3; $r.Ppu.Mask=8; $r.Ppu.ScrollX=255; $r.Ppu.ScrollY=255; $r.Ppu.RenderFrame()
+    $r=New-Rig; $r.Ppu.Ctrl=3; $r.Ppu.Mask=8; $r.Ppu.ScrollX=255; $r.Ppu.ScrollY=255; $r.Ppu.Scanline=0; $r.Ppu.Cycle=0; $r.Ppu.AdvanceDots(262*341)
     Assert-Equal 61440 $r.Ppu.Pixels.Length 'complete framebuffer at seam'
 }
 Case '8x16 ignores PPUCTRL sprite table bit' {
     $r=New-Rig; $r.Ppu.WriteVram(0x0000,0x80); $r.Ppu.WriteVram(0x1000,0x00)
     $r.Ppu.Palette[0x11]=0x2a; $r.Ppu.Oam[0]=0; $r.Ppu.Oam[1]=0; $r.Ppu.Oam[2]=0; $r.Ppu.Oam[3]=0
-    $r.Ppu.Ctrl=0x28; $r.Ppu.Mask=0x14; $r.Ppu.RenderFrame(); Assert-Equal 0x2a $r.Ppu.Pixels[256] '8x16 pixel'
+    $r.Ppu.Ctrl=0x28; $r.Ppu.Mask=0x14; $r.Ppu.Scanline=0; $r.Ppu.Cycle=0; $r.Ppu.AdvanceDots(262*341); Assert-Equal 0x2a $r.Ppu.Pixels[256] '8x16 pixel'
 }
 Case 'sprite zero hit is visible through PPUSTATUS' {
     $r=New-Rig
@@ -3811,7 +3811,7 @@ Case 'sprite zero hit is visible through PPUSTATUS' {
 # Sprite overflow/evaluation is intentionally unsupported. It remains documented
 # in the audit rather than being a required green-gate assertion.
 Case 'sprite Y FF and clipping boundaries' {
-    $r=New-Rig; $r.Ppu.Mask=0x14; $r.Ppu.Oam[0]=0xff; $r.Ppu.Oam[1]=0; $r.Ppu.Oam[2]=0; $r.Ppu.Oam[3]=255; $r.Ppu.RenderFrame()
+    $r=New-Rig; $r.Ppu.Mask=0x14; $r.Ppu.Oam[0]=0xff; $r.Ppu.Oam[1]=0; $r.Ppu.Oam[2]=0; $r.Ppu.Oam[3]=255; $r.Ppu.Scanline=0; $r.Ppu.Cycle=0; $r.Ppu.AdvanceDots(262*341)
     Assert-Equal 61440 $r.Ppu.Pixels.Length 'sprite edge frame remains complete'
 }
 Case 'unsupported mapper image is rejected' {
@@ -3877,7 +3877,7 @@ Case 'AxROM mapper 7 PRG banking and single-screen mirroring' {
     $r.Ppu.WriteVram(0x0000, 0x80); $r.Ppu.WriteVram(0x0008, 0x00) # tile 0 = transparent
     $r.Ppu.WriteVram(0x0010, 0x80); $r.Ppu.WriteVram(0x0018, 0x00) # tile 1 = color 1 at pixel 0
     $r.Ppu.Vram[0x0000]=0; $r.Ppu.Vram[0x0400]=1
-    $r.Ppu.RenderFrame()
+    $r.Ppu.Scanline=0; $r.Ppu.Cycle=0; $r.Ppu.AdvanceDots(341)
     Assert-Equal 0x2C $r.Ppu.Pixels[0] 'AxROM upper nametable rendered pixel'
 }
 Case 'NES 2.0 image loads supported mapper and rejects unsupported mapper' {
