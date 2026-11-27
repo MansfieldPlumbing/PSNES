@@ -635,6 +635,7 @@ class Ppu {
     [byte[]] $Palette
     [byte[]] $Oam
     [Rom] $Rom
+    [Mapper] $CachedMapper
     [int] $Scanline
     [int] $Cycle
     [long] $TotalDots = 0
@@ -683,6 +684,7 @@ class Ppu {
         $this.Palette = [byte[]]::new(32)
         $this.Oam = [byte[]]::new(256)
         $this.Rom = $rom
+        $this.CachedMapper = $rom.EnsureMapper()
         $this.Status = 0xA0
     }
 
@@ -922,8 +924,24 @@ class Ppu {
     }
 
     [void] AdvanceDots([int] $dots) {
-        [Mapper] $mapper = $this.Rom.EnsureMapper()
-        for ([int] $i = 0; $i -lt $dots; $i++) {
+        [Mapper] $mapper = $this.CachedMapper
+        if ($null -eq $mapper) { $mapper = $this.Rom.EnsureMapper(); $this.CachedMapper = $mapper }
+        [int] $i = 0
+        while ($i -lt $dots) {
+            if ($this.Scanline -ge 242 -and $this.Scanline -le 260) {
+                [int] $remInLine = 341 - $this.Cycle
+                [int] $remDots = $dots - $i
+                [int] $step = ($remDots -lt $remInLine) ? $remDots : $remInLine
+                $this.TotalDots += $step
+                $this.Cycle += $step
+                $i += $step
+                if ($this.Cycle -ge 341) {
+                    $this.Cycle = 0
+                    $this.Scanline++
+                }
+                continue
+            }
+            $i++
             $this.TotalDots++
             $this.Cycle++
             if (($this.Mask -band 0x18) -ne 0 -and ($this.Scanline -lt 240 -or $this.Scanline -eq 261)) {
@@ -3161,6 +3179,16 @@ class Nes {
         $this.Ppu.FrameEnded = $false
     }
 
+    [void] RunReplay([byte[]] $p1Inputs, [byte[]] $p2Inputs, [int] $maxFrames) {
+        [int] $count = $p1Inputs.Length
+        if ($maxFrames -gt 0 -and $maxFrames -lt $count) { $count = $maxFrames }
+        for ([int] $f = 0; $f -lt $count; $f++) {
+            [byte] $p2 = ($null -ne $p2Inputs -and $f -lt $p2Inputs.Length) ? $p2Inputs[$f] : [byte]0
+            $this.Memory.SetControllerState($p1Inputs[$f], $p2)
+            $this.RunFrame()
+        }
+    }
+
     [MachineSnapshot] CaptureSnapshot() {
         [MachineSnapshot] $s = [MachineSnapshot]::new()
         $s.Ram = [byte[]]::new($this.Memory.Ram.Length)
@@ -3254,6 +3282,40 @@ class Nes {
 
 # Headless runs: PsnesBench <rom> <frames> runs that many frames with no window, then prints the frame count, the
 # milliseconds taken and a checksum of RAM. The entry point of the native build; the same method runs interpreted.
+class ReplayMovie {
+    # Parses FM2 or BK2 controller 1 input lines (RLDUTSBA order) into NES controller byte masks:
+    # bit 0=A, 1=B, 2=Select(S), 3=Start(T), 4=Up(U), 5=Down(D), 6=Left(L), 7=Right(R).
+    static [byte[]] ParseControllerLines([string[]] $lines) {
+        [Collections.Generic.List[byte]] $result = [Collections.Generic.List[byte]]::new()
+        foreach ($line in $lines) {
+            if ([string]::IsNullOrWhiteSpace($line) -or $line[0] -ne '|') { continue }
+            [string[]] $parts = $line.Split('|')
+            if ($parts.Length -lt 3) { continue }
+            [string] $p1 = $parts[2]
+            if ($p1.Length -lt 8) { continue }
+            [byte] $mask = 0
+            if ($p1[7] -ne '.' -and $p1[7] -ne ' ') { $mask = $mask -bor 0x01 } # A
+            if ($p1[6] -ne '.' -and $p1[6] -ne ' ') { $mask = $mask -bor 0x02 } # B
+            if ($p1[5] -ne '.' -and $p1[5] -ne ' ') { $mask = $mask -bor 0x04 } # Select (S)
+            if ($p1[4] -ne '.' -and $p1[4] -ne ' ') { $mask = $mask -bor 0x08 } # Start (T)
+            if ($p1[3] -ne '.' -and $p1[3] -ne ' ') { $mask = $mask -bor 0x10 } # Up (U)
+            if ($p1[2] -ne '.' -and $p1[2] -ne ' ') { $mask = $mask -bor 0x20 } # Down (D)
+            if ($p1[1] -ne '.' -and $p1[1] -ne ' ') { $mask = $mask -bor 0x40 } # Left (L)
+            if ($p1[0] -ne '.' -and $p1[0] -ne ' ') { $mask = $mask -bor 0x80 } # Right (R)
+            $result.Add($mask)
+        }
+        return $result.ToArray()
+    }
+
+    static [byte[]] ParseFm2([string[]] $lines) {
+        return [ReplayMovie]::ParseControllerLines($lines)
+    }
+
+    static [byte[]] ParseBk2([string[]] $lines) {
+        return [ReplayMovie]::ParseControllerLines($lines)
+    }
+}
+
 class PsnesBench {
     static [int] Main([string[]] $arguments) {
         if ($arguments.Length -ne 2) { [Console]::WriteLine('usage: PsnesBench <rom> <frames>'); return 2 }
@@ -4033,6 +4095,15 @@ Case 'machine snapshot capture and restore determinism' {
     $n.RestoreSnapshot($snap)
     $n.RunFrame(); $ram2 = [PsnesBench]::Checksum($n.Memory.Ram)
     Assert-Equal $ram1 $ram2 'snapshot restore produces identical RAM checksum'
+}
+Case 'FM2 and BK2 replay input ingestion' {
+    $fm2 = [ReplayMovie]::ParseFm2(@('|0|RLDUTSBA|........||', '|0|....T...|........||'))
+    $bk2 = [ReplayMovie]::ParseBk2(@('|    0|RLDUTSBA|........|', '|    0|....T...|........|'))
+    Assert-Equal 2 $fm2.Length 'fm2 frame count'
+    Assert-Equal 0xFF $fm2[0] 'fm2 frame 0 all buttons'
+    Assert-Equal 0x08 $fm2[1] 'fm2 frame 1 start button'
+    Assert-Equal 0xFF $bk2[0] 'bk2 frame 0 all buttons'
+    Assert-Equal 0x08 $bk2[1] 'bk2 frame 1 start button'
 }
 $results | Format-Table -AutoSize
 if (@($results | Where-Object Result -eq 'FAIL').Count -gt 0) { exit 1 }
