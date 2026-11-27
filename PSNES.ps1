@@ -3160,6 +3160,7 @@ class Nes {
 
     [void] PowerOn() {
         if ($this.Rom.IsValid) {
+            $this.Ppu.CachedMapper = $this.Rom.EnsureMapper()
             [int] $sramBytes = $this.Rom.PrgRamSize + $this.Rom.PrgNvramSize
             if ($this.Rom.IsNes2) {
                 $this.Memory.Sram = [byte[]]::new($sramBytes)
@@ -4102,8 +4103,18 @@ Case 'FM2 and BK2 replay input ingestion' {
     Assert-Equal 2 $fm2.Length 'fm2 frame count'
     Assert-Equal 0xFF $fm2[0] 'fm2 frame 0 all buttons'
     Assert-Equal 0x08 $fm2[1] 'fm2 frame 1 start button'
-    Assert-Equal 0xFF $bk2[0] 'bk2 frame 0 all buttons'
-    Assert-Equal 0x08 $bk2[1] 'bk2 frame 1 start button'
+    Assert-Equal $true ($bk2[0] -eq 0xFF) 'bk2 frame 0 all buttons'
+    Assert-Equal $true ($bk2[1] -eq 0x08) 'bk2 frame 1 start button'
+}
+Case 'PPU CachedMapper matches Rom.EnsureMapper after PowerOn' {
+    $n = [Nes]::new()
+    $n.Rom.PrgRom = [byte[]]::new(32768); $n.Rom.ChrRom = [byte[]]::new(8192); $n.Rom.ChrRam = $true; $n.Rom.IsValid = $true
+    $n.Rom.Mapper = 1; $n.Rom.MapperImpl = $null
+    $n.PowerOn()
+    Assert-Equal $true ([object]::ReferenceEquals($n.Ppu.CachedMapper, $n.Rom.EnsureMapper())) 'MMC1 PPU CachedMapper identity'
+    $n.Rom.Mapper = 4; $n.Rom.MapperImpl = $null
+    $n.PowerOn()
+    Assert-Equal $true ([object]::ReferenceEquals($n.Ppu.CachedMapper, $n.Rom.EnsureMapper())) 'MMC3 PPU CachedMapper identity after reload'
 }
 $results | Format-Table -AutoSize
 if (@($results | Where-Object Result -eq 'FAIL').Count -gt 0) { exit 1 }
