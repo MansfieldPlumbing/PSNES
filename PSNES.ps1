@@ -34,7 +34,7 @@ class Mapper {
     [void] PpuWrite([ushort] $address, [byte] $value) { }
     [Mirroring] GetMirroring() { return $this.Rom.Mirroring }
     [void] ClockIrq() { }
-    [void] ObservePpuAddress([ushort] $address) { }
+    [void] ObservePpuAddress([ushort] $address, [long] $ppuDot) { }
     [bool] IsIrqPending() { return $false }
 }
 
@@ -281,7 +281,7 @@ class Mapper4 : Mapper {
     [bool] $IrqEnabled = $false
     [bool] $IrqPending = $false
     [bool] $LastA12 = $false
-    [int] $A12LowDots = 0
+    [long] $LastA12LowDot = -100
 
     Mapper4([Rom] $rom) : base($rom) {
         $this.MirrorMode = $rom.Mirroring
@@ -397,15 +397,16 @@ class Mapper4 : Mapper {
         return $this.IrqPending
     }
 
-    [void] ObservePpuAddress([ushort] $address) {
+    [void] ObservePpuAddress([ushort] $address, [long] $ppuDot) {
         [bool] $a12 = ($address -band 0x1000) -ne 0
         if ($a12) {
-            if (-not $this.LastA12 -and $this.A12LowDots -ge 9) {
+            if (-not $this.LastA12 -and ($ppuDot - $this.LastA12LowDot) -ge 9) {
                 $this.ClockIrq()
             }
-            $this.A12LowDots = 0
         } else {
-            $this.A12LowDots++
+            if ($this.LastA12 -or $this.LastA12LowDot -lt 0) {
+                $this.LastA12LowDot = $ppuDot
+            }
         }
         $this.LastA12 = $a12
     }
@@ -628,6 +629,7 @@ class Ppu {
     [Rom] $Rom
     [int] $Scanline
     [int] $Cycle
+    [long] $TotalDots = 0
 
     [byte] $Ctrl
     [byte] $Mask
@@ -747,7 +749,7 @@ class Ppu {
 
     [byte] ReadVram([ushort] $addr) {
         $addr = $addr % 0x4000
-        $this.Rom.EnsureMapper().ObservePpuAddress($addr)
+        $this.Rom.EnsureMapper().ObservePpuAddress($addr, $this.TotalDots)
         if ($addr -lt 0x2000) {
             return $this.Rom.EnsureMapper().PpuRead($addr)
         } elseif ($addr -lt 0x3F00) {
@@ -764,7 +766,7 @@ class Ppu {
 
     [void] WriteVram([ushort] $addr, [byte] $val) {
         $addr = $addr % 0x4000
-        $this.Rom.EnsureMapper().ObservePpuAddress($addr)
+        $this.Rom.EnsureMapper().ObservePpuAddress($addr, $this.TotalDots)
         if ($addr -lt 0x2000) {
             $this.Rom.EnsureMapper().PpuWrite($addr, $val)
         } elseif ($addr -lt 0x3F00) {
@@ -913,14 +915,15 @@ class Ppu {
 
     [void] AdvanceDots([int] $dots) {
         for ([int] $i = 0; $i -lt $dots; $i++) {
+            $this.TotalDots++
             $this.Cycle++
             if (($this.Mask -band 0x18) -ne 0 -and ($this.Scanline -lt 240 -or $this.Scanline -eq 261)) {
                 if ($this.Cycle -ge 257 -and $this.Cycle -le 320) {
                     [ushort] $sprAddr = (($this.Ctrl -band 0x28) -ne 0) ? [ushort]0x1000 : [ushort]0x0000
-                    $this.Rom.EnsureMapper().ObservePpuAddress($sprAddr)
+                    $this.Rom.EnsureMapper().ObservePpuAddress($sprAddr, $this.TotalDots)
                 } elseif (($this.Cycle -ge 1 -and $this.Cycle -le 256) -or ($this.Cycle -ge 321 -and $this.Cycle -le 336)) {
                     [ushort] $bgAddr = (($this.Ctrl -band 0x10) -ne 0) ? [ushort]0x1000 : [ushort]0x0000
-                    $this.Rom.EnsureMapper().ObservePpuAddress($bgAddr)
+                    $this.Rom.EnsureMapper().ObservePpuAddress($bgAddr, $this.TotalDots)
                 }
             }
             if ($this.Cycle -ge 341) {
@@ -2972,6 +2975,7 @@ class Cpu6502 {
     }
 
     [void] DoIrq([int] $status) {
+        $this.instrBusCycles += 2
         $this.Ppu.AdvanceDots(6)
         $this.REG_PC_NEW = ($this.REG_PC_NEW + 1) -band 0xFFFF
         $this.Push([byte](($this.REG_PC_NEW -shr 8) -band 0xFF))
@@ -3010,7 +3014,13 @@ class Nes {
     }
 
     [void] PowerOn() {
-        if ($this.Rom.IsValid) { $this.Cpu.Reset() }
+        if ($this.Rom.IsValid) {
+            [int] $sramBytes = $this.Rom.PrgRamSize + $this.Rom.PrgNvramSize
+            if ($sramBytes -gt 0 -and $this.Memory.Sram.Length -ne $sramBytes) {
+                $this.Memory.Sram = [byte[]]::new($sramBytes)
+            }
+            $this.Cpu.Reset()
+        }
     }
 
     [void] RunFrame() {
@@ -3751,6 +3761,19 @@ Case 'MMC3 mapper 4 PRG/CHR banking and IRQ counter' {
     Assert-Equal 0x8fff $r.Cpu.REG_PC 'MMC3 IRQ vector convention'
     Assert-Equal 1 $r.Cpu.F_INTERRUPT 'MMC3 IRQ sets I flag'
     $r.Mem.Write(0xE000, 0); Assert-Equal $false $m4.IrqPending 'MMC3 IRQ acknowledged'
+}
+Case 'MMC3 A12 filter requires 9+ low PPU dots before rising edge' {
+    $r=New-Rig; $r.Rom.Mapper=4; $r.Rom.MapperImpl=$null
+    $m4 = [Mapper4]$r.Rom.EnsureMapper()
+    $r.Mem.Write(0xC000, 0); $r.Mem.Write(0xC001, 0); $r.Mem.Write(0xE001, 0)
+    [void]$r.Ppu.ReadVram(0x0000) # A12 low at dot 0
+    $r.Ppu.AdvanceDots(4)
+    [void]$r.Ppu.ReadVram(0x1000) # Rising edge after only 4 dots -> filtered out
+    Assert-Equal $false $m4.IrqPending 'MMC3 A12 glitch (<9 dots) ignored'
+    [void]$r.Ppu.ReadVram(0x0000) # A12 falls at dot 4
+    $r.Ppu.AdvanceDots(9)
+    [void]$r.Ppu.ReadVram(0x1000) # Rising edge after 9 dots -> clocks IRQ
+    Assert-Equal $true $m4.IrqPending 'MMC3 A12 >=9 low dots clocks IRQ'
 }
 Case 'GxROM mapper 66 PRG and CHR banking' {
     $r=New-Rig; $r.Rom.Mapper=66; $r.Rom.MapperImpl=$null
