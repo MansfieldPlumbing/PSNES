@@ -21,7 +21,6 @@ enum Mirroring {
 class Mapper {
     [Rom] $Rom
 
-    Mapper() { }
     Mapper([Rom] $rom) {
         $this.Rom = $rom
     }
@@ -36,7 +35,7 @@ class Mapper {
 }
 
 class Mapper0 : Mapper {
-    Mapper0([Rom] $rom) { $this.Rom = $rom }
+    Mapper0([Rom] $rom) : base($rom) { }
 
     [byte] CpuRead([ushort] $address) {
         if ($address -ge 0x8000 -and $this.Rom.IsValid -and $null -ne $this.Rom.PrgRom -and $this.Rom.PrgRom.Length -gt 0) {
@@ -72,7 +71,7 @@ class Mapper1 : Mapper {
     [byte] $ChrBank1 = 0
     [byte] $PrgBank = 0
 
-    Mapper1([Rom] $rom) { $this.Rom = $rom }
+    Mapper1([Rom] $rom) : base($rom) { }
 
     [byte] CpuRead([ushort] $address) {
         if ($address -lt 0x8000 -or -not $this.Rom.IsValid -or $null -eq $this.Rom.PrgRom -or $this.Rom.PrgRom.Length -eq 0) { return 0 }
@@ -181,7 +180,7 @@ class Mapper1 : Mapper {
 class Mapper2 : Mapper {
     [int] $PrgBank = 0
 
-    Mapper2([Rom] $rom) { $this.Rom = $rom }
+    Mapper2([Rom] $rom) : base($rom) { }
 
     [byte] CpuRead([ushort] $address) {
         if ($address -lt 0x8000 -or -not $this.Rom.IsValid -or $null -eq $this.Rom.PrgRom -or $this.Rom.PrgRom.Length -eq 0) { return 0 }
@@ -220,7 +219,7 @@ class Mapper2 : Mapper {
 class Mapper3 : Mapper {
     [int] $ChrBank = 0
 
-    Mapper3([Rom] $rom) { $this.Rom = $rom }
+    Mapper3([Rom] $rom) : base($rom) { }
 
     [byte] CpuRead([ushort] $address) {
         if ($address -ge 0x8000 -and $this.Rom.IsValid -and $null -ne $this.Rom.PrgRom -and $this.Rom.PrgRom.Length -gt 0) {
@@ -254,7 +253,7 @@ class Mapper7 : Mapper {
     [int] $PrgBank = 0
     [Mirroring] $MirrorMode = [Mirroring]::SingleScreen
 
-    Mapper7([Rom] $rom) { $this.Rom = $rom }
+    Mapper7([Rom] $rom) : base($rom) { }
 
     [byte] CpuRead([ushort] $address) {
         if ($address -ge 0x8000 -and $this.Rom.IsValid -and $null -ne $this.Rom.PrgRom -and $this.Rom.PrgRom.Length -gt 0) {
