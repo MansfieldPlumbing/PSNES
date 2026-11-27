@@ -32,6 +32,8 @@ class Mapper {
     [byte] PpuRead([ushort] $address) { return 0 }
     [void] PpuWrite([ushort] $address, [byte] $value) { }
     [Mirroring] GetMirroring() { return $this.Rom.Mirroring }
+    [void] ClockIrq() { }
+    [bool] IsIrqPending() { return $false }
 }
 
 class Mapper0 : Mapper {
@@ -374,6 +376,10 @@ class Mapper4 : Mapper {
 
     [Mirroring] GetMirroring() {
         return $this.MirrorMode
+    }
+
+    [bool] IsIrqPending() {
+        return $this.IrqPending
     }
 
     [void] ClockIrq() {
@@ -876,6 +882,9 @@ class Ppu {
     [void] AdvanceDots([int] $dots) {
         for ([int] $i = 0; $i -lt $dots; $i++) {
             $this.Cycle++
+            if ($this.Cycle -eq 260 -and ($this.Mask -band 0x18) -ne 0 -and ($this.Scanline -lt 240 -or $this.Scanline -eq 261)) {
+                $this.Rom.EnsureMapper().ClockIrq()
+            }
             if ($this.Cycle -ge 341) {
                 $this.Cycle = 0
                 $this.Scanline++
@@ -2788,6 +2797,14 @@ class Cpu6502 {
             $this.F_BRK = $this.F_BRK_NEW
             $this.nmiPending = $false
             $interruptCycles = 7
+        } elseif ($this.F_INTERRUPT -eq 0 -and $this.Mem.Rom.EnsureMapper().IsIrqPending()) {
+            $this.REG_PC_NEW = $this.REG_PC
+            $this.F_INTERRUPT_NEW = $this.F_INTERRUPT
+            $this.DoIrq($this.GetStatus() -band 0xEF)
+            $this.REG_PC = $this.REG_PC_NEW
+            $this.F_INTERRUPT = $this.F_INTERRUPT_NEW
+            $this.F_BRK = $this.F_BRK_NEW
+            $interruptCycles = 7
         }
 
         $this._cpuCycleBase += ($cycleCount + $interruptCycles)
@@ -3541,7 +3558,9 @@ Case 'JSR pushes return address and RTS restores it' {
 }
 Case 'NMI pending is serviced after following instruction' {
     $r=New-Rig; $r.Rom.PrgRom[0x7ffa]=0x00; $r.Rom.PrgRom[0x7ffb]=0x90; $r.Cpu.nmiRaised=$true
-    Run-One $r ([byte[]](0xea)); Assert-Equal $false $r.Cpu.nmiPending 'NMI consumed'; Assert-Equal 0x8fff $r.Cpu.REG_PC 'NMI vector convention'
+    $r.Rom.PrgRom[8192*2] = 0xea
+    $r.Cpu.REG_PC = 0x7FFF
+    [void]$r.Cpu.Emulate(); Assert-Equal $false $r.Cpu.nmiPending 'NMI consumed'; Assert-Equal 0x8fff $r.Cpu.REG_PC 'NMI vector convention'
 }
 Case 'VBlank edge and status read latch' {
     $r=New-Rig; $r.Ppu.Scanline=240; $r.Ppu.Cycle=340; $r.Ppu.Status=0
@@ -3678,6 +3697,14 @@ Case 'MMC3 mapper 4 PRG/CHR banking and IRQ counter' {
     $r.Mem.Write(0xC000, 1); $r.Mem.Write(0xC001, 0); $r.Mem.Write(0xE001, 0)
     $m4.ClockIrq(); Assert-Equal $false $m4.IrqPending 'MMC3 IRQ reload to 1'
     $m4.ClockIrq(); Assert-Equal $true $m4.IrqPending 'MMC3 IRQ fires at 0'
+    # Verify level-sensitive CPU IRQ delivery when I flag is clear
+    $r.Rom.PrgRom[65534] = 0x00; $r.Rom.PrgRom[65535] = 0x90
+    $r.Cpu.F_INTERRUPT = 0
+    $r.Rom.PrgRom[8192*2] = 0xea
+    $r.Cpu.REG_PC = 0x7FFF
+    [void]$r.Cpu.Emulate()
+    Assert-Equal 0x8fff $r.Cpu.REG_PC 'MMC3 IRQ vector convention'
+    Assert-Equal 1 $r.Cpu.F_INTERRUPT 'MMC3 IRQ sets I flag'
     $r.Mem.Write(0xE000, 0); Assert-Equal $false $m4.IrqPending 'MMC3 IRQ acknowledged'
 }
 Case 'GxROM mapper 66 PRG and CHR banking' {
