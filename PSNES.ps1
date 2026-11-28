@@ -3557,12 +3557,11 @@ class PsnesBench {
         return 0
     }
 
-    # Rotate left by 5, then xor the next byte: a short fingerprint of a machine state, for comparing two runs.
-    # Shifts never overflow, so this means the same interpreted and lowered.
+    # 64-bit shift-xor-rotate hash: avoids 64-byte periodic cancellation and never overflows to double in PowerShell.
     static [ulong] Checksum([byte[]] $bytes) {
-        [ulong] $hash = 0
+        [ulong] $hash = 14695981039346656037UL
         for ([int] $i = 0; $i -lt $bytes.Length; $i++) {
-            $hash = (($hash -shl 5) -bor ($hash -shr 59)) -bxor $bytes[$i]
+            $hash = ((($hash -shl 7) -bor ($hash -shr 57)) -bxor ($hash -shr 13)) -bxor $bytes[$i]
         }
         return $hash
     }
@@ -4403,6 +4402,15 @@ Case 'PixelSource exact provenance and snapshot RomHash rejection' {
     [bool] $threw = $false
     try { $n2.RestoreSnapshot($badSnap) } catch { $threw = $true }
     Assert-Equal $true $threw 'RestoreSnapshot rejects mismatched RomHash'
+}
+Case 'PsnesBench.Checksum distinguishes 64-byte periodic buffers' {
+    $z = [byte[]]::new(61440)
+    $u = [byte[]]::new(61440); for ($i = 0; $i -lt $u.Length; $i++) { $u[$i] = 0x22 }
+    $p = [byte[]]::new(61440); $p[0] = 0x15; $p[64] = 0x15
+    $r64 = [byte[]]::new(61440); for ($i = 0; $i -lt $r64.Length; $i++) { $r64[$i] = [byte]($i -band 63) }
+    $hZ = [PsnesBench]::Checksum($z); $hU = [PsnesBench]::Checksum($u)
+    $hP = [PsnesBench]::Checksum($p); $hR = [PsnesBench]::Checksum($r64)
+    Assert-Equal $true ($hZ -ne $hU -and $hZ -ne $hP -and $hZ -ne $hR -and $hU -ne $hP -and $hU -ne $hR -and $hP -ne $hR) '4 collision controls produce distinct hashes'
 }
 $results | Format-Table -AutoSize
 if (@($results | Where-Object Result -eq 'FAIL').Count -gt 0) { exit 1 }

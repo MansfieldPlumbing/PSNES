@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param(
     [string] $RomPath = (Join-Path $PSScriptRoot 'ROMS\Super Mario Bros. + Duck Hunt (USA).nes'),
-    [string] $OutputDir = (Join-Path $PSScriptRoot 'evidence\smb_native_001')
+    [string] $OutputDir = (Join-Path $PSScriptRoot 'evidence\smb_native_001'),
+    [string] $CompiledDll = ''
 )
 
 Set-StrictMode -Version Latest
@@ -15,7 +16,78 @@ if (-not (Test-Path $RomPath)) {
 $romSha256 = (Get-FileHash -Path $RomPath -Algorithm SHA256).Hash
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
-. (Join-Path $PSScriptRoot 'PSNES.ps1')
+if ($CompiledDll -and (Test-Path $CompiledDll)) {
+    Add-Type -Path $CompiledDll
+} else {
+    . (Join-Path $PSScriptRoot 'PSNES.ps1')
+}
+
+function Write-PsnesObservations {
+    param([string] $Path, [NesObservation[]] $Observations)
+    $fs = [IO.File]::Create($Path)
+    $bw = [IO.BinaryWriter]::new($fs)
+    try {
+        $bw.Write([byte[]]@(0x50, 0x53, 0x4E, 0x31))
+        $bw.Write([int]$Observations.Length)
+        foreach ($o in $Observations) {
+            $bw.Write([int]$o.FrameIndex)
+            $bw.Write([long]$o.TotalDots)
+            $bw.Write([long]$o.TotalCycles)
+            $bw.Write([int]$o.A); $bw.Write([int]$o.X); $bw.Write([int]$o.Y); $bw.Write([int]$o.SP); $bw.Write([int]$o.PC)
+            $bw.Write([byte]$o.Ctrl); $bw.Write([byte]$o.Mask); $bw.Write([byte]$o.Status)
+            $bw.Write([byte]$o.ScrollX); $bw.Write([byte]$o.ScrollY); $bw.Write([ushort]$o.VramAddr); $bw.Write([byte]$o.FineX)
+            $bw.Write([byte]$o.Controller1); $bw.Write([byte]$o.Controller2)
+            $bw.Write($o.Ram)
+            $bw.Write($o.Oam)
+            $bw.Write($o.Vram)
+            $bw.Write($o.Palette)
+            $bw.Write($o.Pixels)
+            [int] $psLen = ($null -ne $o.PixelSource) ? $o.PixelSource.Length : 0
+            $bw.Write($psLen)
+            for ($i = 0; $i -lt $psLen; $i++) { $bw.Write($o.PixelSource[$i]) }
+        }
+    } finally {
+        $bw.Dispose(); $fs.Dispose()
+    }
+}
+
+function Read-PsnesObservations {
+    param([string] $Path)
+    $fs = [IO.File]::OpenRead($Path)
+    $br = [IO.BinaryReader]::new($fs)
+    try {
+        $magic = $br.ReadBytes(4)
+        if ($magic[0] -ne 0x50 -or $magic[1] -ne 0x53 -or $magic[2] -ne 0x4E -or $magic[3] -ne 0x31) {
+            throw "Invalid psnesobs magic in $Path"
+        }
+        [int] $count = $br.ReadInt32()
+        $list = [NesObservation[]]::new($count)
+        for ($idx = 0; $idx -lt $count; $idx++) {
+            $o = [NesObservation]::new()
+            $o.FrameIndex = $br.ReadInt32()
+            $o.TotalDots = $br.ReadInt64()
+            $o.TotalCycles = $br.ReadInt64()
+            $o.A = $br.ReadInt32(); $o.X = $br.ReadInt32(); $o.Y = $br.ReadInt32(); $o.SP = $br.ReadInt32(); $o.PC = $br.ReadInt32()
+            $o.Ctrl = $br.ReadByte(); $o.Mask = $br.ReadByte(); $o.Status = $br.ReadByte()
+            $o.ScrollX = $br.ReadByte(); $o.ScrollY = $br.ReadByte(); $o.VramAddr = $br.ReadUInt16(); $o.FineX = $br.ReadByte()
+            $o.Controller1 = $br.ReadByte(); $o.Controller2 = $br.ReadByte()
+            $o.Ram = $br.ReadBytes(2048)
+            $o.Oam = $br.ReadBytes(256)
+            $o.Vram = $br.ReadBytes(4096)
+            $o.Palette = $br.ReadBytes(32)
+            $o.Pixels = $br.ReadBytes(61440)
+            [int] $psLen = $br.ReadInt32()
+            if ($psLen -gt 0) {
+                $o.PixelSource = [int[]]::new($psLen)
+                for ($i = 0; $i -lt $psLen; $i++) { $o.PixelSource[$i] = $br.ReadInt32() }
+            }
+            $list[$idx] = $o
+        }
+        return $list
+    } finally {
+        $br.Dispose(); $fs.Dispose()
+    }
+}
 
 function Invoke-SmbTrajectory {
     param([string] $Path, [byte[]] $Inputs, [int] $RecordFromFrame)
@@ -77,33 +149,63 @@ $withheldInputs[40] = 0x08; $withheldInputs[41] = 0x08
 for ($f = 150; $f -lt 240; $f++) { $withheldInputs[$f] = 0x82 }
 $withheld = Invoke-SmbTrajectory -Path $RomPath -Inputs $withheldInputs -RecordFromFrame 150
 
-$orig240 = $primary.Observations[240 - 150]
-$bA240   = $branchAObs[39]
-$bB240   = $branchBObs[39]
+# Byte-exact equality check across all 40 corresponding frames (201..240) of Primary vs Branch A
+[bool] $byteExact = $true
+for ($i = 0; $i -lt 40; $i++) {
+    $o1 = $primary.Observations[(201 - 150) + $i]
+    $o2 = $branchAObs[$i]
+    if ($o1.TotalDots -ne $o2.TotalDots -or $o1.TotalCycles -ne $o2.TotalCycles) { $byteExact = $false; break }
+    if ([Linq.Enumerable]::SequenceEqual($o1.Ram, $o2.Ram) -eq $false -or
+        [Linq.Enumerable]::SequenceEqual($o1.Oam, $o2.Oam) -eq $false -or
+        [Linq.Enumerable]::SequenceEqual($o1.Pixels, $o2.Pixels) -eq $false -or
+        [Linq.Enumerable]::SequenceEqual($o1.PixelSource, $o2.PixelSource) -eq $false) {
+        $byteExact = $false; break
+    }
+}
+if (-not $byteExact) { throw 'Branch A failed byte-exact continuation equality!' }
 
-$summary = [pscustomobject]@{
-    TrajectoryType       = 'PSNES-native controller trajectory (not a synchronized FM2/BK2 replay)'
-    RomSha256            = $romSha256
-    PrimaryFrameCount    = $primary.Observations.Length
-    WithheldFrameCount   = $withheld.Observations.Length
-    BranchPointFrame     = 200
-    Orig240RamChecksum   = [PsnesBench]::Checksum($orig240.Ram).ToString('X16')
-    BranchA240RamChecksum = [PsnesBench]::Checksum($bA240.Ram).ToString('X16')
-    Orig240FbChecksum    = [PsnesBench]::Checksum($orig240.Pixels).ToString('X16')
-    BranchA240FbChecksum = [PsnesBench]::Checksum($bA240.Pixels).ToString('X16')
-    BranchB240RamChecksum = [PsnesBench]::Checksum($bB240.Ram).ToString('X16')
-    BranchB240FbChecksum = [PsnesBench]::Checksum($bB240.Pixels).ToString('X16')
-    Orig240ScrollX       = $orig240.ScrollX
-    BranchA240ScrollX    = $bA240.ScrollX
-    BranchB240ScrollX    = $bB240.ScrollX
+# Persist all 320 observations in compact typed binary format
+$pPath = Join-Path $OutputDir 'primary.psnesobs'
+$wPath = Join-Path $OutputDir 'withheld.psnesobs'
+$aPath = Join-Path $OutputDir 'branch_a.psnesobs'
+$bPath = Join-Path $OutputDir 'branch_b.psnesobs'
+Write-PsnesObservations -Path $pPath -Observations $primary.Observations
+Write-PsnesObservations -Path $wPath -Observations $withheld.Observations
+Write-PsnesObservations -Path $aPath -Observations $branchAObs.ToArray()
+Write-PsnesObservations -Path $bPath -Observations $branchBObs.ToArray()
+
+# Verify round-trip read
+$rt = Read-PsnesObservations -Path $pPath
+if ($rt.Length -ne 150 -or -not [Linq.Enumerable]::SequenceEqual($rt[90].Pixels, $primary.Observations[90].Pixels)) {
+    throw 'Round-trip Read-PsnesObservations verification failed!'
 }
 
-$summary | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $OutputDir 'summary.json') -Encoding UTF8
-[IO.File]::WriteAllBytes((Join-Path $OutputDir 'primary_inputs.bin'), $primaryInputs)
-[IO.File]::WriteAllBytes((Join-Path $OutputDir 'withheld_inputs.bin'), $withheldInputs)
-[IO.File]::WriteAllBytes((Join-Path $OutputDir 'orig_240_pixels.bin'), $orig240.Pixels)
-[IO.File]::WriteAllBytes((Join-Path $OutputDir 'branch_b_240_pixels.bin'), $bB240.Pixels)
-[IO.File]::WriteAllBytes((Join-Path $OutputDir 'orig_240_oam.bin'), $orig240.Oam)
-[IO.File]::WriteAllBytes((Join-Path $OutputDir 'branch_b_240_oam.bin'), $bB240.Oam)
+# Visual variation stats on frame 240
+$orig240 = $primary.Observations[240 - 150]
+$bB240   = $branchBObs[39]
+$distinctColors = @($orig240.Pixels | Select-Object -Unique).Count
+[int] $bgCount = 0; [int] $sprCount = 0; [int] $univCount = 0
+foreach ($ps in $orig240.PixelSource) {
+    $kind = $ps -band 0x30000000
+    if ($kind -eq 0x10000000) { $bgCount++ }
+    elseif ($kind -eq 0x20000000) { $sprCount++ }
+    else { $univCount++ }
+}
+[int] $diffPixels = 0
+for ($i = 0; $i -lt 61440; $i++) { if ($orig240.Pixels[$i] -ne $bB240.Pixels[$i]) { $diffPixels++ } }
 
-$summary | Format-List
+$manifest = [pscustomobject]@{
+    TrajectoryType     = 'PSNES-native controller trajectory (not a synchronized FM2/BK2 replay)'
+    PsnesCommit        = (git -C $PSScriptRoot rev-parse --short HEAD)
+    RomSha256          = $romSha256
+    ByteExactBranchA   = $byteExact
+    Frame240DistinctColors = $distinctColors
+    Frame240PixelSource    = "univ=$univCount, bg=$bgCount, spr=$sprCount"
+    OrigVsBranchBDiffPx    = $diffPixels
+    PrimarySha256      = (Get-FileHash $pPath -Algorithm SHA256).Hash
+    WithheldSha256     = (Get-FileHash $wPath -Algorithm SHA256).Hash
+    BranchASha256      = (Get-FileHash $aPath -Algorithm SHA256).Hash
+    BranchBSha256      = (Get-FileHash $bPath -Algorithm SHA256).Hash
+}
+$manifest | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $OutputDir 'manifest.json') -Encoding UTF8
+$manifest | Format-List
