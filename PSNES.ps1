@@ -3242,6 +3242,20 @@ class Nes {
         $this.Ppu.FrameEnded = $false
     }
 
+    [void] PowerCycle() {
+        if (-not $this.Rom.IsValid) { return }
+        [Array]::Clear($this.Memory.Ram, 0, $this.Memory.Ram.Length)
+        [Array]::Clear($this.Ppu.Vram, 0, $this.Ppu.Vram.Length)
+        [Array]::Clear($this.Ppu.Palette, 0, $this.Ppu.Palette.Length)
+        [Array]::Clear($this.Ppu.Oam, 0, $this.Ppu.Oam.Length)
+        [Array]::Clear($this.Ppu.Pixels, 0, $this.Ppu.Pixels.Length)
+        $this.Ppu.Scanline = 0; $this.Ppu.Cycle = 0; $this.Ppu.TotalDots = 0
+        $this.Ppu.Ctrl = 0; $this.Ppu.Mask = 0; $this.Ppu.Status = 0xA0
+        $this.Ppu.WriteToggle = $false; $this.Ppu.VramAddr = 0; $this.Ppu.TempAddr = 0; $this.Ppu.FineX = 0
+        $this.Rom.MapperImpl = $null
+        $this.PowerOn()
+    }
+
     [void] RunReplay([ReplayMovie] $movie, [int] $maxFrames) {
         if ($null -eq $movie -or $null -eq $movie.P1Inputs) { return }
         [int] $count = $movie.P1Inputs.Length
@@ -3249,7 +3263,7 @@ class Nes {
         for ([int] $f = 0; $f -lt $count; $f++) {
             if ($null -ne $movie.CommandFlags -and $f -lt $movie.CommandFlags.Length) {
                 [int] $cmd = $movie.CommandFlags[$f]
-                if (($cmd -band 2) -ne 0) { $this.PowerOn() }
+                if (($cmd -band 2) -ne 0) { $this.PowerCycle() }
                 elseif (($cmd -band 1) -ne 0) { $this.Cpu.Reset() }
             }
             [byte] $p2 = ($null -ne $movie.P2Inputs -and $f -lt $movie.P2Inputs.Length) ? $movie.P2Inputs[$f] : [byte]0
@@ -3578,9 +3592,10 @@ class ReplayMovie {
                 continue
             }
             [string[]] $parts = $line.Split('|')
-            if ($parts.Length -lt 3) { continue }
+            if ($parts.Length -lt 4) { throw "Malformed FM2 input record: $line" }
             [int] $cmd = 0
-            [void][int]::TryParse($parts[1].Trim(), [ref]$cmd)
+            if (-not [int]::TryParse($parts[1].Trim(), [ref]$cmd)) { throw "Malformed FM2 command field: $($parts[1])" }
+            if (($cmd -band -bnot 3) -ne 0) { throw "Unsupported FM2 command bits: $cmd" }
             $cmds.Add($cmd)
             $rst.Add(($cmd -band 1) -ne 0)
             $p1.Add([ReplayMovie]::ParsePortButtons($parts[2]))
@@ -4498,8 +4513,13 @@ Case 'FM2 header validation, dual-port, reset, and PAL rejection' {
     $nRep.Rom.PrgRom[0] = 0xEA; $nRep.Rom.PrgRom[1] = 0x4C; $nRep.Rom.PrgRom[2] = 0x00; $nRep.Rom.PrgRom[3] = 0x80
     $nRep.Rom.PrgRom[0x7FFC] = 0x00; $nRep.Rom.PrgRom[0x7FFD] = 0x80
     $nRep.PowerOn()
-    $nRep.RunReplay($m, 2)
-    Assert-Equal 0 $nRep.Memory.Controller1 'RunReplay executed frame 1 controller state'
+    $nRep.Memory.Ram[0x10] = 0x5A
+    $mPwr = [ReplayMovie]::LoadFm2Lines(@('|2|........|........||'))
+    $nRep.RunReplay($mPwr, 1)
+    Assert-Equal 0 $nRep.Memory.Ram[0x10] 'PowerCycle clears RAM'
+    [bool] $badCmd = $false
+    try { [void][ReplayMovie]::LoadFm2Lines(@('|X|........|........||')) } catch { $badCmd = $true }
+    Assert-Equal $true $badCmd 'FM2 rejects malformed command'
 }
 $results | Format-Table -AutoSize
 if (@($results | Where-Object Result -eq 'FAIL').Count -gt 0) { exit 1 }
