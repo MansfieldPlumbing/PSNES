@@ -3510,28 +3510,61 @@ class Nes {
 # Headless runs: PsnesBench <rom> <frames> runs that many frames with no window, then prints the frame count, the
 # milliseconds taken and a checksum of RAM. The entry point of the native build; the same method runs interpreted.
 class ReplayMovie {
+    [byte[]] $P1Inputs
+    [byte[]] $P2Inputs
+    [bool[]] $ResetFrames
+    [string] $RomChecksum = ''
+    [bool] $IsPal = $false
+
+    static [byte] ParsePortButtons([string] $port) {
+        if ($port.Length -lt 8) { return 0 }
+        [byte] $mask = 0
+        if ($port[7] -ne '.' -and $port[7] -ne ' ') { $mask = $mask -bor 0x01 } # A
+        if ($port[6] -ne '.' -and $port[6] -ne ' ') { $mask = $mask -bor 0x02 } # B
+        if ($port[5] -ne '.' -and $port[5] -ne ' ') { $mask = $mask -bor 0x04 } # Select (S)
+        if ($port[4] -ne '.' -and $port[4] -ne ' ') { $mask = $mask -bor 0x08 } # Start (T)
+        if ($port[3] -ne '.' -and $port[3] -ne ' ') { $mask = $mask -bor 0x10 } # Up (U)
+        if ($port[2] -ne '.' -and $port[2] -ne ' ') { $mask = $mask -bor 0x20 } # Down (D)
+        if ($port[1] -ne '.' -and $port[1] -ne ' ') { $mask = $mask -bor 0x40 } # Left (L)
+        if ($port[0] -ne '.' -and $port[0] -ne ' ') { $mask = $mask -bor 0x80 } # Right (R)
+        return $mask
+    }
+
+    static [ReplayMovie] LoadFm2Lines([string[]] $lines) {
+        [ReplayMovie] $movie = [ReplayMovie]::new()
+        [Collections.Generic.List[byte]] $p1 = [Collections.Generic.List[byte]]::new()
+        [Collections.Generic.List[byte]] $p2 = [Collections.Generic.List[byte]]::new()
+        [Collections.Generic.List[bool]] $rst = [Collections.Generic.List[bool]]::new()
+        foreach ($line in $lines) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            if ($line[0] -ne '|') {
+                if ($line.StartsWith('palFlag ')) {
+                    if ($line.Substring(8).Trim() -eq '1') { throw 'Unsupported FM2 configuration: PAL timing is not supported.' }
+                } elseif ($line.StartsWith('fourscore ')) {
+                    if ($line.Substring(10).Trim() -eq '1') { throw 'Unsupported FM2 configuration: FourScore is not supported.' }
+                } elseif ($line.StartsWith('romChecksum ')) {
+                    $movie.RomChecksum = $line.Substring(12).Trim()
+                }
+                continue
+            }
+            [string[]] $parts = $line.Split('|')
+            if ($parts.Length -lt 3) { continue }
+            [int] $cmd = 0
+            [void][int]::TryParse($parts[1].Trim(), [ref]$cmd)
+            $rst.Add(($cmd -band 1) -ne 0)
+            $p1.Add([ReplayMovie]::ParsePortButtons($parts[2]))
+            $p2.Add(($parts.Length -ge 4 -and $parts[3].Length -ge 8) ? [ReplayMovie]::ParsePortButtons($parts[3]) : [byte]0)
+        }
+        $movie.P1Inputs = $p1.ToArray()
+        $movie.P2Inputs = $p2.ToArray()
+        $movie.ResetFrames = $rst.ToArray()
+        return $movie
+    }
+
     # Parses FM2 or BK2 controller 1 input lines (RLDUTSBA order) into NES controller byte masks:
     # bit 0=A, 1=B, 2=Select(S), 3=Start(T), 4=Up(U), 5=Down(D), 6=Left(L), 7=Right(R).
     static [byte[]] ParseControllerLines([string[]] $lines) {
-        [Collections.Generic.List[byte]] $result = [Collections.Generic.List[byte]]::new()
-        foreach ($line in $lines) {
-            if ([string]::IsNullOrWhiteSpace($line) -or $line[0] -ne '|') { continue }
-            [string[]] $parts = $line.Split('|')
-            if ($parts.Length -lt 3) { continue }
-            [string] $p1 = $parts[2]
-            if ($p1.Length -lt 8) { continue }
-            [byte] $mask = 0
-            if ($p1[7] -ne '.' -and $p1[7] -ne ' ') { $mask = $mask -bor 0x01 } # A
-            if ($p1[6] -ne '.' -and $p1[6] -ne ' ') { $mask = $mask -bor 0x02 } # B
-            if ($p1[5] -ne '.' -and $p1[5] -ne ' ') { $mask = $mask -bor 0x04 } # Select (S)
-            if ($p1[4] -ne '.' -and $p1[4] -ne ' ') { $mask = $mask -bor 0x08 } # Start (T)
-            if ($p1[3] -ne '.' -and $p1[3] -ne ' ') { $mask = $mask -bor 0x10 } # Up (U)
-            if ($p1[2] -ne '.' -and $p1[2] -ne ' ') { $mask = $mask -bor 0x20 } # Down (D)
-            if ($p1[1] -ne '.' -and $p1[1] -ne ' ') { $mask = $mask -bor 0x40 } # Left (L)
-            if ($p1[0] -ne '.' -and $p1[0] -ne ' ') { $mask = $mask -bor 0x80 } # Right (R)
-            $result.Add($mask)
-        }
-        return $result.ToArray()
+        return [ReplayMovie]::LoadFm2Lines($lines).P1Inputs
     }
 
     static [byte[]] ParseFm2([string[]] $lines) {
@@ -4411,6 +4444,17 @@ Case 'PsnesBench.Checksum distinguishes 64-byte periodic buffers' {
     $hZ = [PsnesBench]::Checksum($z); $hU = [PsnesBench]::Checksum($u)
     $hP = [PsnesBench]::Checksum($p); $hR = [PsnesBench]::Checksum($r64)
     Assert-Equal $true ($hZ -ne $hU -and $hZ -ne $hP -and $hZ -ne $hR -and $hU -ne $hP -and $hU -ne $hR -and $hP -ne $hR) '4 collision controls produce distinct hashes'
+}
+Case 'FM2 header validation, dual-port, reset, and PAL rejection' {
+    $m = [ReplayMovie]::LoadFm2Lines(@('version 3', 'romChecksum base64:ABC', '|0|RLDUTSBA|.......A||', '|1|........|........||'))
+    Assert-Equal 'base64:ABC' $m.RomChecksum 'FM2 romChecksum parsed'
+    Assert-Equal 0xFF $m.P1Inputs[0] 'FM2 P1 frame 0'
+    Assert-Equal 0x01 $m.P2Inputs[0] 'FM2 P2 frame 0'
+    Assert-Equal $false $m.ResetFrames[0] 'FM2 frame 0 no reset'
+    Assert-Equal $true $m.ResetFrames[1] 'FM2 frame 1 reset'
+    [bool] $palRejected = $false
+    try { [void][ReplayMovie]::LoadFm2Lines(@('palFlag 1', '|0|........|........||')) } catch { $palRejected = $true }
+    Assert-Equal $true $palRejected 'FM2 rejects PAL timing'
 }
 $results | Format-Table -AutoSize
 if (@($results | Where-Object Result -eq 'FAIL').Count -gt 0) { exit 1 }
