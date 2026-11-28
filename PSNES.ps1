@@ -3553,8 +3553,7 @@ class PsnesBench {
         $clock = [Diagnostics.Stopwatch]::StartNew()
         for ([int] $frame = 0; $frame -lt $frames; $frame++) { $nes.RunFrame() }
         $clock.Stop()
-        [Console]::WriteLine('{0} frames in {1} ms; RAM checksum {2:X16}', $frames, $clock.ElapsedMilliseconds, [PsnesBench]::Checksum($nes.Memory.Ram))
-        [Console]::WriteLine('FB checksum {0:X16}', [PsnesBench]::Checksum($nes.Ppu.Pixels))
+        [Console]::WriteLine('{0} frames in {1} ms; RAM checksum {2:X16}; FB checksum {3:X16}', $frames, $clock.ElapsedMilliseconds, [PsnesBench]::Checksum($nes.Memory.Ram), [PsnesBench]::Checksum($nes.Ppu.Pixels))
         return 0
     }
 
