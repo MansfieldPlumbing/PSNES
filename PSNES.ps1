@@ -3548,16 +3548,22 @@ class ReplayMovie {
     [bool] $IsPal = $false
 
     static [byte] ParsePortButtons([string] $port) {
-        if ($port.Length -lt 8) { return 0 }
+        if ($port.Length -ne 8) { throw "Malformed FM2 controller port field (expected 8 chars): '$port'" }
         [byte] $mask = 0
-        if ($port[7] -ne '.' -and $port[7] -ne ' ') { $mask = $mask -bor 0x01 } # A
-        if ($port[6] -ne '.' -and $port[6] -ne ' ') { $mask = $mask -bor 0x02 } # B
-        if ($port[5] -ne '.' -and $port[5] -ne ' ') { $mask = $mask -bor 0x04 } # Select (S)
-        if ($port[4] -ne '.' -and $port[4] -ne ' ') { $mask = $mask -bor 0x08 } # Start (T)
-        if ($port[3] -ne '.' -and $port[3] -ne ' ') { $mask = $mask -bor 0x10 } # Up (U)
-        if ($port[2] -ne '.' -and $port[2] -ne ' ') { $mask = $mask -bor 0x20 } # Down (D)
-        if ($port[1] -ne '.' -and $port[1] -ne ' ') { $mask = $mask -bor 0x40 } # Left (L)
-        if ($port[0] -ne '.' -and $port[0] -ne ' ') { $mask = $mask -bor 0x80 } # Right (R)
+        for ([int] $i = 0; $i -lt 8; $i++) {
+            [char] $ch = $port[$i]
+            if ($ch -eq '.' -or $ch -eq ' ') { continue }
+            switch ($i) {
+                0 { if ($ch -ne 'R') { throw "Invalid FM2 button char '$ch' at index 0" }; $mask = $mask -bor 0x80 }
+                1 { if ($ch -ne 'L') { throw "Invalid FM2 button char '$ch' at index 1" }; $mask = $mask -bor 0x40 }
+                2 { if ($ch -ne 'D') { throw "Invalid FM2 button char '$ch' at index 2" }; $mask = $mask -bor 0x20 }
+                3 { if ($ch -ne 'U') { throw "Invalid FM2 button char '$ch' at index 3" }; $mask = $mask -bor 0x10 }
+                4 { if ($ch -ne 'T') { throw "Invalid FM2 button char '$ch' at index 4" }; $mask = $mask -bor 0x08 }
+                5 { if ($ch -ne 'S') { throw "Invalid FM2 button char '$ch' at index 5" }; $mask = $mask -bor 0x04 }
+                6 { if ($ch -ne 'B') { throw "Invalid FM2 button char '$ch' at index 6" }; $mask = $mask -bor 0x02 }
+                7 { if ($ch -ne 'A') { throw "Invalid FM2 button char '$ch' at index 7" }; $mask = $mask -bor 0x01 }
+            }
+        }
         return $mask
     }
 
