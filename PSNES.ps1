@@ -3242,6 +3242,22 @@ class Nes {
         $this.Ppu.FrameEnded = $false
     }
 
+    [void] RunReplay([ReplayMovie] $movie, [int] $maxFrames) {
+        if ($null -eq $movie -or $null -eq $movie.P1Inputs) { return }
+        [int] $count = $movie.P1Inputs.Length
+        if ($maxFrames -gt 0 -and $maxFrames -lt $count) { $count = $maxFrames }
+        for ([int] $f = 0; $f -lt $count; $f++) {
+            if ($null -ne $movie.CommandFlags -and $f -lt $movie.CommandFlags.Length) {
+                [int] $cmd = $movie.CommandFlags[$f]
+                if (($cmd -band 2) -ne 0) { $this.PowerOn() }
+                elseif (($cmd -band 1) -ne 0) { $this.Cpu.Reset() }
+            }
+            [byte] $p2 = ($null -ne $movie.P2Inputs -and $f -lt $movie.P2Inputs.Length) ? $movie.P2Inputs[$f] : [byte]0
+            $this.Memory.SetControllerState($movie.P1Inputs[$f], $p2)
+            $this.RunFrame()
+        }
+    }
+
     [void] RunReplay([byte[]] $p1Inputs, [byte[]] $p2Inputs, [int] $maxFrames) {
         [int] $count = $p1Inputs.Length
         if ($maxFrames -gt 0 -and $maxFrames -lt $count) { $count = $maxFrames }
@@ -3513,6 +3529,7 @@ class ReplayMovie {
     [byte[]] $P1Inputs
     [byte[]] $P2Inputs
     [bool[]] $ResetFrames
+    [int[]] $CommandFlags
     [string] $RomChecksum = ''
     [bool] $IsPal = $false
 
@@ -3535,13 +3552,26 @@ class ReplayMovie {
         [Collections.Generic.List[byte]] $p1 = [Collections.Generic.List[byte]]::new()
         [Collections.Generic.List[byte]] $p2 = [Collections.Generic.List[byte]]::new()
         [Collections.Generic.List[bool]] $rst = [Collections.Generic.List[bool]]::new()
+        [Collections.Generic.List[int]] $cmds = [Collections.Generic.List[int]]::new()
         foreach ($line in $lines) {
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
             if ($line[0] -ne '|') {
-                if ($line.StartsWith('palFlag ')) {
+                if ($line.StartsWith('version ')) {
+                    if ($line.Substring(8).Trim() -ne '3') { throw 'Unsupported FM2 version: only version 3 is supported.' }
+                } elseif ($line.StartsWith('palFlag ')) {
                     if ($line.Substring(8).Trim() -eq '1') { throw 'Unsupported FM2 configuration: PAL timing is not supported.' }
                 } elseif ($line.StartsWith('fourscore ')) {
                     if ($line.Substring(10).Trim() -eq '1') { throw 'Unsupported FM2 configuration: FourScore is not supported.' }
+                } elseif ($line.StartsWith('binary ')) {
+                    if ($line.Substring(7).Trim() -eq '1') { throw 'Unsupported FM2 configuration: binary input logs are not supported.' }
+                } elseif ($line.StartsWith('savestate ')) {
+                    throw 'Unsupported FM2 configuration: savestate-dependent movies are not supported.'
+                } elseif ($line.StartsWith('port0 ')) {
+                    [string] $pv = $line.Substring(6).Trim()
+                    if ($pv -ne '0' -and $pv -ne '1') { throw "Unsupported FM2 port0 device: $pv" }
+                } elseif ($line.StartsWith('port1 ')) {
+                    [string] $pv = $line.Substring(6).Trim()
+                    if ($pv -ne '0' -and $pv -ne '1') { throw "Unsupported FM2 port1 device: $pv" }
                 } elseif ($line.StartsWith('romChecksum ')) {
                     $movie.RomChecksum = $line.Substring(12).Trim()
                 }
@@ -3551,6 +3581,7 @@ class ReplayMovie {
             if ($parts.Length -lt 3) { continue }
             [int] $cmd = 0
             [void][int]::TryParse($parts[1].Trim(), [ref]$cmd)
+            $cmds.Add($cmd)
             $rst.Add(($cmd -band 1) -ne 0)
             $p1.Add([ReplayMovie]::ParsePortButtons($parts[2]))
             $p2.Add(($parts.Length -ge 4 -and $parts[3].Length -ge 8) ? [ReplayMovie]::ParsePortButtons($parts[3]) : [byte]0)
@@ -3558,6 +3589,7 @@ class ReplayMovie {
         $movie.P1Inputs = $p1.ToArray()
         $movie.P2Inputs = $p2.ToArray()
         $movie.ResetFrames = $rst.ToArray()
+        $movie.CommandFlags = $cmds.ToArray()
         return $movie
     }
 
@@ -4455,6 +4487,19 @@ Case 'FM2 header validation, dual-port, reset, and PAL rejection' {
     [bool] $palRejected = $false
     try { [void][ReplayMovie]::LoadFm2Lines(@('palFlag 1', '|0|........|........||')) } catch { $palRejected = $true }
     Assert-Equal $true $palRejected 'FM2 rejects PAL timing'
+    [bool] $binRejected = $false
+    try { [void][ReplayMovie]::LoadFm2Lines(@('binary 1', '|0|........|........||')) } catch { $binRejected = $true }
+    Assert-Equal $true $binRejected 'FM2 rejects binary logs'
+    [bool] $zapperRejected = $false
+    try { [void][ReplayMovie]::LoadFm2Lines(@('port0 2', '|0|........|........||')) } catch { $zapperRejected = $true }
+    Assert-Equal $true $zapperRejected 'FM2 rejects unsupported port0 device'
+    $nRep = [Nes]::new()
+    $nRep.Rom.PrgRom = [byte[]]::new(32768); $nRep.Rom.ChrRom = [byte[]]::new(8192); $nRep.Rom.IsValid = $true
+    $nRep.Rom.PrgRom[0] = 0xEA; $nRep.Rom.PrgRom[1] = 0x4C; $nRep.Rom.PrgRom[2] = 0x00; $nRep.Rom.PrgRom[3] = 0x80
+    $nRep.Rom.PrgRom[0x7FFC] = 0x00; $nRep.Rom.PrgRom[0x7FFD] = 0x80
+    $nRep.PowerOn()
+    $nRep.RunReplay($m, 2)
+    Assert-Equal 0 $nRep.Memory.Controller1 'RunReplay executed frame 1 controller state'
 }
 $results | Format-Table -AutoSize
 if (@($results | Where-Object Result -eq 'FAIL').Count -gt 0) { exit 1 }
