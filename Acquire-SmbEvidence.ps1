@@ -114,14 +114,18 @@ function Invoke-SmbTrajectory {
     }
 }
 
-# Primary PSNES-native trajectory: Start at 40-41, Right (0x80) from 150..299, Jump (0x81) at 210..224
-[byte[]] $primaryInputs = [byte[]]::new(300)
+# Primary PSNES-native World 1-1 trajectory:
+# Start at 40-41 (select SMB on 2-in-1 menu), Start at 110-111 (start 1P game),
+# then Right (0x80) from 170..349 with Jump (0x81) at 230..249 and 280..299.
+[byte[]] $primaryInputs = [byte[]]::new(350)
 $primaryInputs[40] = 0x08; $primaryInputs[41] = 0x08
-for ($f = 150; $f -lt 300; $f++) {
-    $primaryInputs[$f] = ($f -ge 210 -and $f -le 224) ? [byte]0x81 : [byte]0x80
+$primaryInputs[110] = 0x08; $primaryInputs[111] = 0x08
+for ($f = 170; $f -lt 350; $f++) {
+    $jump = ($f -ge 230 -and $f -le 249) -or ($f -ge 280 -and $f -le 299)
+    $primaryInputs[$f] = $jump ? [byte]0x81 : [byte]0x80
 }
 
-$primary = Invoke-SmbTrajectory -Path $RomPath -Inputs $primaryInputs -RecordFromFrame 150
+$primary = Invoke-SmbTrajectory -Path $RomPath -Inputs $primaryInputs -RecordFromFrame 170
 
 # Branch A (identical continuation from frame 200 for 40 frames)
 $branchA = $primary.Nes.Branch($primary.Snapshot200)
@@ -143,16 +147,17 @@ for ($f = 201; $f -le 240; $f++) {
     $branchBObs.Add($branchB.CaptureObservation($f))
 }
 
-# Withheld trajectory: Right+B dash (0x82) from frame 150..239
-[byte[]] $withheldInputs = [byte[]]::new(240)
+# Withheld trajectory: Right+B dash (0x82) from frame 170..259
+[byte[]] $withheldInputs = [byte[]]::new(260)
 $withheldInputs[40] = 0x08; $withheldInputs[41] = 0x08
-for ($f = 150; $f -lt 240; $f++) { $withheldInputs[$f] = 0x82 }
-$withheld = Invoke-SmbTrajectory -Path $RomPath -Inputs $withheldInputs -RecordFromFrame 150
+$withheldInputs[110] = 0x08; $withheldInputs[111] = 0x08
+for ($f = 170; $f -lt 260; $f++) { $withheldInputs[$f] = 0x82 }
+$withheld = Invoke-SmbTrajectory -Path $RomPath -Inputs $withheldInputs -RecordFromFrame 170
 
 # Byte-exact equality check across all 40 corresponding frames (201..240) of Primary vs Branch A
 [bool] $byteExact = $true
 for ($i = 0; $i -lt 40; $i++) {
-    $o1 = $primary.Observations[(201 - 150) + $i]
+    $o1 = $primary.Observations[(201 - 170) + $i]
     $o2 = $branchAObs[$i]
     if ($o1.TotalDots -ne $o2.TotalDots -or $o1.TotalCycles -ne $o2.TotalCycles) { $byteExact = $false; break }
     if ([Linq.Enumerable]::SequenceEqual($o1.Ram, $o2.Ram) -eq $false -or
@@ -176,12 +181,12 @@ Write-PsnesObservations -Path $bPath -Observations $branchBObs.ToArray()
 
 # Verify round-trip read
 $rt = Read-PsnesObservations -Path $pPath
-if ($rt.Length -ne 150 -or -not [Linq.Enumerable]::SequenceEqual($rt[90].Pixels, $primary.Observations[90].Pixels)) {
+if ($rt.Length -ne $primary.Observations.Length -or -not [Linq.Enumerable]::SequenceEqual($rt[90].Pixels, $primary.Observations[90].Pixels)) {
     throw 'Round-trip Read-PsnesObservations verification failed!'
 }
 
 # Visual variation stats on frame 240
-$orig240 = $primary.Observations[240 - 150]
+$orig240 = $primary.Observations[240 - 170]
 $bB240   = $branchBObs[39]
 $distinctColors = @($orig240.Pixels | Select-Object -Unique).Count
 [int] $bgCount = 0; [int] $sprCount = 0; [int] $univCount = 0
@@ -195,9 +200,10 @@ foreach ($ps in $orig240.PixelSource) {
 for ($i = 0; $i -lt 61440; $i++) { if ($orig240.Pixels[$i] -ne $bB240.Pixels[$i]) { $diffPixels++ } }
 
 $manifest = [pscustomobject]@{
-    TrajectoryType     = 'PSNES-native controller trajectory (not a synchronized FM2/BK2 replay)'
-    PsnesCommit        = (git -C $PSScriptRoot rev-parse --short HEAD)
-    RomSha256          = $romSha256
+    TrajectoryType         = 'PSNES-native World 1-1 controller trajectory (not a synchronized FM2/BK2 replay)'
+    PsnesCommit            = (git -C $PSScriptRoot rev-parse --short HEAD)
+    CompiledDllSha256      = ($CompiledDll -and (Test-Path $CompiledDll)) ? (Get-FileHash $CompiledDll -Algorithm SHA256).Hash : 'interpreted'
+    RomSha256              = $romSha256
     ByteExactBranchA   = $byteExact
     Frame240DistinctColors = $distinctColors
     Frame240PixelSource    = "univ=$univCount, bg=$bgCount, spr=$sprCount"
